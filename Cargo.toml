@@ -1,0 +1,25 @@
+[package]
+name = "speech-to-text-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+clap = { version = "4.6.6", features = ["derive"] }
+cpal = "0.18.1"
+crossbeam-channel = "0.5.16"
+earshot = "1.2.1"
+hound = "3.5"
+# Signal handling only: Ctrl-C must restore the terminal rather than leaving
+# the alternate screen entered, and take the transcript with it.
+libc = "0.2"
+# 5.x reworked the API around `audioadapter`; 0.16 keeps the SincFixedIn form.
+rubato = "0.16.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.151"
+terminal_size = "0.4.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
