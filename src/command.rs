@@ -67,6 +67,44 @@ pub enum Command {
     Rollback,
 }
 
+/// Every verb, in the order they are announced to the model.
+///
+/// Kept beside [`Command::exact`] rather than derived from it, with a test below
+/// that fails if anything here stops parsing — the two must not drift, because a
+/// verb the model is told about but the parser does not know is worse than one
+/// it was never told about.
+const VERBS: [&str; 6] = ["commit", "reject", "clear", "copy", "undo", "rollback"];
+
+/// The command vocabulary as one line, for the ASR model to be told about.
+///
+/// # This is the exception to "the sidecar receives audio and nothing else"
+///
+/// §7 forbids feeding text to the model, on a measurement: the **transcript** as
+/// `system_prompt` was replayed verbatim whenever a window held no speech, and
+/// it self-reinforced because the echo was committed and came back in the next
+/// prompt. That reasoning turns on the prompt being *dynamic and derived from
+/// what the speaker said*. This one is neither, and the difference is measurable
+/// rather than argued — on `Qwen3-ASR-1.7B-8bit`:
+///
+/// | case | no prompt | with this |
+/// |---|---|---|
+/// | 20s of noise at −38 dBFS | `""` | `""` — no echo |
+/// | 41s of ordinary dictation | — | byte-identical |
+/// | `Luna went to the store.` | dictation | dictation — no false command |
+/// | spoken "Luna, rollback" | `Luna, roll back.` | `Luna rollback.` |
+///
+/// That last row is why it earns its place. `roll back` is two words, so the
+/// parser correctly refuses it — nothing may come between the wake word and the
+/// verb — and the speaker has no way to see why their command did nothing.
+///
+/// The invariant survives in a stronger form: this is passed **once, at spawn**,
+/// from configuration. The per-window protocol still carries audio and nothing
+/// else, so no code path exists by which the transcript could reach the model.
+pub fn hint(wake: &str) -> String {
+    let spoken: Vec<String> = VERBS.iter().map(|verb| format!("{wake} {verb}")).collect();
+    format!("Commands: {}.", spoken.join(", "))
+}
+
 impl Command {
     /// The verb as spoken, or as the model chose to write it.
     ///
@@ -475,6 +513,33 @@ mod tests {
         ] {
             assert_eq!(split_str(line), vec![text(line)], "must be left alone: {line:?}");
         }
+    }
+
+    /// The hint and the parser must not drift: a verb the model is told about
+    /// but the parser cannot read is worse than one it was never told about,
+    /// because the speaker then says a command that is heard and ignored.
+    #[test]
+    fn every_announced_verb_is_one_the_parser_accepts() {
+        for verb in VERBS {
+            assert_eq!(
+                split_str(&format!("Luna {verb}")),
+                vec![Segment::Run(Command::from_verb(verb).expect("announced"))],
+                "announced but not parsed: {verb:?}"
+            );
+        }
+    }
+
+    /// It is announced to the model verbatim, so it has to read as the words a
+    /// speaker would actually say — and it has to follow `--assistant`.
+    #[test]
+    fn the_hint_names_the_configured_wake_word() {
+        assert_eq!(
+            hint("Luna"),
+            "Commands: Luna commit, Luna reject, Luna clear, Luna copy, \
+             Luna undo, Luna rollback."
+        );
+        assert!(hint("Jarvis").starts_with("Commands: Jarvis commit,"));
+        assert!(!hint("Jarvis").contains("Luna"));
     }
 
     /// The wake word is configurable, so nothing may be hard-coded to "luna".

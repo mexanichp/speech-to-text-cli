@@ -28,8 +28,19 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::transcript::Sentence;
+
+/// Longest the utterance in flight may go unwritten.
+///
+/// The document is written the instant it changes, which is a few times a
+/// minute. In-flight text changes on every tick, and putting an `fsync` on the
+/// tick would be real cost for no gain — but leaving it out entirely was worse
+/// than it looked. §5 means every ordinary pause merges, so between trims
+/// *nothing* reaches the document and the in-flight buffer is where the whole
+/// passage lives. Two seconds bounds what a crash can take to about one clause.
+const IN_FLIGHT_EVERY: Duration = Duration::from_secs(2);
 
 /// The session file, rewritten whenever the document changes.
 pub struct Store {
@@ -37,6 +48,10 @@ pub struct Store {
     persist: bool,
     /// Revision last written, so an unchanged document costs nothing.
     written: Option<u64>,
+    /// In-flight text as of the last write, so an unchanged utterance is free
+    /// too and only genuine movement pays.
+    in_flight: String,
+    last_write: Instant,
     /// Set once writing fails, so a full disk reports once instead of on every
     /// sentence for the rest of the session.
     failed: bool,
@@ -59,6 +74,8 @@ impl Store {
             path,
             persist,
             written: None,
+            in_flight: String::new(),
+            last_write: Instant::now(),
             failed: false,
         })
     }
@@ -79,6 +96,8 @@ impl Store {
             path,
             persist,
             written: None,
+            in_flight: String::new(),
+            last_write: Instant::now(),
             failed: false,
         }
     }
@@ -87,19 +106,45 @@ impl Store {
         &self.path
     }
 
-    /// Write the document if it has changed since the last write.
+    /// Write the document, plus whatever is still in flight, if either moved.
+    ///
+    /// `in_flight` is the text the pipeline holds that has not reached the
+    /// document yet. Passing it is what stops the safety net from depending on
+    /// the buffer trim: mid-passage the trim is the *only* thing that files
+    /// anything, so a passage the speaker never paused long enough to settle
+    /// used to exist nowhere but process memory — exactly the situation this
+    /// module was written to rule out.
     ///
     /// Returns an error message the first time it fails and `None` afterwards.
     /// Losing the autosave is worth saying once; it is not worth ending a
     /// dictation session over, because the in-memory document is still intact
     /// and still reaches stdout at exit.
-    pub fn save(&mut self, document: &[Sentence], revision: u64) -> Option<String> {
-        if self.failed || self.written == Some(revision) {
+    pub fn save(&mut self, document: &[Sentence], revision: u64, in_flight: &str) -> Option<String> {
+        if self.failed {
             return None;
         }
-        self.written = Some(revision);
 
-        match write_atomically(&self.path, document) {
+        let settled = self.written != Some(revision);
+        if !settled && self.in_flight == in_flight {
+            return None;
+        }
+
+        // A growing utterance moves on every tick, so it is rate-limited rather
+        // than written through. A *shrinking* one is not: it shrinks because the
+        // document absorbed it, and deferring that would leave the file
+        // momentarily claiming the same words twice.
+        if !settled
+            && in_flight.len() > self.in_flight.len()
+            && self.last_write.elapsed() < IN_FLIGHT_EVERY
+        {
+            return None;
+        }
+
+        self.written = Some(revision);
+        self.in_flight = in_flight.to_string();
+        self.last_write = Instant::now();
+
+        match write_atomically(&self.path, document, in_flight) {
             Ok(()) => None,
             Err(e) => {
                 self.failed = true;
@@ -172,12 +217,29 @@ pub fn load(path: &Path) -> Result<Vec<Sentence>> {
 /// A rename is atomic, so a crash midway leaves either the previous transcript
 /// or the new one — never a half-written file, which is the one outcome worse
 /// than not having autosaved at all.
-fn write_atomically(path: &Path, document: &[Sentence]) -> Result<()> {
+fn write_atomically(path: &Path, document: &[Sentence], in_flight: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = std::fs::File::create(&tmp)?;
         for sentence in document {
             writeln!(file, "{}", sentence.text())?;
+        }
+        // The passage still being spoken, last and unmarked. It is deliberately
+        // not distinguished from settled text: the file has to stay a clean
+        // transcript, because `--persist` hands it to a human and `--resume`
+        // reads it straight back. A clean exit files the tail first, so this
+        // only survives into a file a crash left behind — which is the only case
+        // where a partial last sentence beats no last sentence.
+        //
+        // Split the same way `file()` splits a finished utterance, so one line
+        // is one sentence everywhere in this format. Measured on a 20 s passage
+        // killed with `kill -9`, writing it whole recovered four sentences as a
+        // single 230-character line — which `--resume` would then hand back as
+        // one unrejectable blob.
+        for part in crate::text::split_sentences(in_flight.trim()) {
+            if !part.is_empty() {
+                writeln!(file, "{part}")?;
+            }
         }
         file.sync_all()?;
     }
@@ -282,7 +344,7 @@ mod tests {
         let path = dir.join("t.txt");
 
         let doc = [sentence("Kept one.", true), sentence("Still pending.", false)];
-        write_atomically(&path, &doc).expect("write");
+        write_atomically(&path, &doc, "").expect("write");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
@@ -291,7 +353,7 @@ mod tests {
 
         // Rewriting replaces rather than appends, so a reject really shrinks
         // the file instead of leaving the dropped sentence behind.
-        write_atomically(&path, &doc[..1]).expect("rewrite");
+        write_atomically(&path, &doc[..1], "").expect("rewrite");
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "Kept one.\n");
 
         // And the temporary never survives a successful write.
@@ -312,7 +374,7 @@ mod tests {
             sentence("Second one!", false),
             sentence("\u{4f60}\u{597d}\u{3002}", false),
         ];
-        write_atomically(&path, &doc).expect("write");
+        write_atomically(&path, &doc, "").expect("write");
         let back = load(&path).expect("load");
 
         let texts: Vec<String> = back.iter().map(Sentence::text).collect();
@@ -325,6 +387,136 @@ mod tests {
         assert!(back.iter().all(|s| s.committed));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stt-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("t.txt")
+    }
+
+    /// The failure the user hit: mid-passage the buffer trim is the only thing
+    /// that files anything into the document, so a long merged passage left the
+    /// session file empty of everything that had been said. The in-flight line
+    /// is what makes the safety net independent of the trim.
+    #[test]
+    fn the_utterance_in_flight_reaches_the_file() {
+        let path = scratch("inflight");
+        let doc = [sentence("Already filed.", false)];
+
+        write_atomically(&path, &doc, "and this is still being said").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "Already filed.\nand this is still being said\n"
+        );
+
+        // It has to come back as ordinary recoverable text, since the whole
+        // point is that `--resume` picks it up after a crash.
+        let back = load(&path).expect("load");
+        assert_eq!(
+            back.iter().map(Sentence::text).collect::<Vec<_>>(),
+            ["Already filed.", "and this is still being said"]
+        );
+
+        // And a passage that has not settled at all is still not lost.
+        write_atomically(&path, &[], "nothing has settled yet").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "nothing has settled yet\n"
+        );
+
+        // One line is one sentence everywhere in this format, so a long
+        // in-flight passage is split the same way `file()` splits a finished
+        // one. Measured: 20 s killed with `kill -9` recovered four sentences as
+        // a single 230-character line before this.
+        write_atomically(&path, &[], "One thought. Then a second. And a third").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "One thought.\nThen a second.\nAnd a third\n"
+        );
+
+        // An empty tail must not leave a blank line behind: `split_sentences`
+        // returns the input whole when it finds no boundary, empty included.
+        write_atomically(&path, &doc, "").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "Already filed.\n");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// A settling document is written through; a growing utterance is not, or
+    /// there would be an `fsync` on every tick for a line that changes anyway.
+    #[test]
+    fn a_growing_utterance_is_rate_limited_but_the_document_is_not() {
+        let path = scratch("throttle");
+        let mut store = Store::adopt(path.clone(), true);
+        let doc = [sentence("One.", false)];
+
+        assert_eq!(store.save(&doc, 1, "i am talking"), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "One.\ni am talking\n"
+        );
+
+        // More words, same document, well inside the window: deferred.
+        assert_eq!(store.save(&doc, 1, "i am talking and talking"), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "One.\ni am talking\n",
+            "a growing utterance must not write through on every tick"
+        );
+
+        // The document moving overrides the rate limit, because a settled
+        // sentence is exactly what this file exists to hold.
+        let doc = [sentence("One.", false), sentence("Two.", false)];
+        assert_eq!(store.save(&doc, 2, "i am talking and talking"), None);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "One.\nTwo.\ni am talking and talking\n"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// The in-flight line shrinks when the document absorbs it. Deferring that
+    /// would leave the file briefly holding the same words twice — once as a
+    /// sentence and once as the tail — which is worse than a stale tail.
+    #[test]
+    fn an_absorbed_utterance_is_cleared_immediately() {
+        let path = scratch("absorb");
+        let mut store = Store::adopt(path.clone(), true);
+
+        store.save(&[], 0, "this will settle");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "this will settle\n");
+
+        // Same revision, so only the in-flight line moved — and it shrank.
+        store.save(&[], 0, "");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "",
+            "a shrinking tail must not wait out the rate limit"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
+    }
+
+    /// An unchanged session must still cost nothing, which is what kept this
+    /// off the hot path in the first place.
+    #[test]
+    fn an_unchanged_session_is_never_rewritten() {
+        let path = scratch("unchanged");
+        let mut store = Store::adopt(path.clone(), true);
+        let doc = [sentence("Settled.", true)];
+
+        store.save(&doc, 1, "");
+        let before = std::fs::metadata(&path).and_then(|m| m.modified()).expect("mtime");
+
+        for _ in 0..10 {
+            assert_eq!(store.save(&doc, 1, ""), None);
+        }
+        let after = std::fs::metadata(&path).and_then(|m| m.modified()).expect("mtime");
+        assert_eq!(before, after, "nothing moved, so nothing may be written");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
     /// A file half-written by a crash, or one a user has edited by hand, must

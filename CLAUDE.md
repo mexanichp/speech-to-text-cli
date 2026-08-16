@@ -228,6 +228,30 @@ taking the same passage from 9 broken sentences to 7 clean ones. The merge seam
 is pushed as a candidate too, since the reconstructed pause is by construction
 the longest silence in the buffer.
 
+**"Never cut" needed a bound, because "keeps growing" had none.** D9 says a
+buffer with no gap in it is simply not cut, and that the cost is latency. That
+was wrong about the cost. Reported live: a speaker who never left 190ms reached a
+**63.6s buffer**, at which point one forward pass ran ~67s and the tick stretched
+to ~84s — the session stopped responding, and (before the fix below) nothing had
+reached the document either.
+
+So the trim now records every silence down to `MIN_DIP_FRAMES` (~64ms) and
+raises the bar rather than the candidate list:
+
+| buffer | eligible gaps |
+|---|---|
+| < `--trim-after-s` | *(no trim)* |
+| ≥ `--trim-after-s` | ≥ ~190ms — D9's quality bar, unchanged |
+| ≥ 2 × `--trim-after-s` | any recorded silence, longest still preferred |
+
+A ~64ms silence can be the closure of a stop consonant rather than a word
+boundary, so cutting there really can clip one. That is the trade being made
+knowingly: a bad cut is a bad sentence, an unbounded buffer is not an outcome at
+all. It only ever *adds* candidates in a situation that had none, and the
+longest-gap preference is untouched, so nothing changes for a speaker who pauses
+normally. Verified with `--trim-after-s 10` on 80s of continuous speech: the
+buffer peaked at **13.3s** against the 20s bound.
+
 ### Measured duty cycle, end to end
 
 On the 42s passage above, at `--trim-after-s 30` with everything else default:
@@ -466,6 +490,16 @@ why. It was always a promise about the *pipeline*:
 | dim | the pipeline may still rewrite this |
 | plain, `│` gutter | settled; only the speaker can change it now |
 | plain, no gutter | the speaker committed it |
+| `⋮` gutter, top row | more transcript above than the screen holds |
+
+The last of those is about the screen rather than the text, and it exists
+because its absence cost two wrong diagnoses. **The live tail is never capped**
+— a speaker who has not finished has to read what they are saying (§1) — so on
+a long buffer the document scrolls out of view. It used to do that silently,
+which is indistinguishable from the document being empty, which is what it
+actually was. Nothing is hidden to make room for the marker: it replaces a
+gutter that was already budgeted, so it cannot widen a row (§7 records the last
+elision marker doing exactly that).
 
 A speaker rejecting their own sentence is not the pipeline changing its mind, so
 plain text still means what it always meant.
@@ -674,6 +708,47 @@ path — the file is rewritten when a sentence settles or a command runs, a few
 times a minute, and `Transcript::revision` makes an unchanged document free. A
 failed write reports **once** and the session continues on memory alone; losing
 the safety net is not a reason to end a dictation session.
+
+#### The file holds the utterance in flight too, and has to
+
+"Written on every change to the document" was not the same guarantee as "holds
+what the speaker has said", and the gap between them was the whole passage.
+Reported from a live session as `Luna, copy` copying nothing and the session file
+being empty of everything just dictated.
+
+Mid-passage the **buffer trim is the only thing that files anything**. §5 merges
+every ordinary pause, so an utterance never settles, `finalize_window` files
+nothing by design, and the grace never closes. Between trims the text exists
+only in `Pending` and `Transcript::committed` — process memory, which is exactly
+what this module was written to stop relying on. The document, `copy` and the
+file all read `script.document()`, so one empty document explains all three
+reported symptoms at once.
+
+`Store::save` therefore takes the in-flight text as well, and writes it as
+trailing lines. Measured on a 41 s continuously-merging passage:
+
+| | file at T+20s | after `kill -9` at T+20s |
+|---|---|---|
+| document only | *(empty — 0 document entries until the first trim at ~T+33s)* | nothing |
+| **with in-flight** | 4 sentences | the same 4 sentences |
+
+Three decisions inside it:
+
+- **Rate-limited, not written through.** The document is written the instant it
+  moves; a *growing* in-flight line moves every tick and would put an `fsync` on
+  the tick for no gain. 2 s bounds what a crash takes to about a clause.
+- **A *shrinking* one is written immediately.** It shrinks because the document
+  absorbed it, and deferring that would leave the file briefly holding the same
+  words twice.
+- **Split with `split_sentences`, like `file()` does.** One line is one sentence
+  everywhere in this format. Written whole, the 20 s recovery above came back as
+  a single 230-character line, which `--resume` would hand back as one
+  unrejectable blob.
+
+The line is deliberately unmarked, because the file has to stay a clean
+transcript — `--persist` hands it to a human and `--resume` reads it straight
+back. A clean exit files the tail first and then saves with an empty tail, so an
+in-flight line only ever survives into a file a crash left behind.
 
 #### Resume
 
@@ -997,14 +1072,74 @@ sentence recorded without the stutter.
   the transcript replayed four times and then degenerated into `"So."` forever;
   without it, one garbled line for the babble and nothing else.
 
-  **Invariant: the sidecar receives audio and nothing else.** `transcribe` takes
-  no text argument, so reintroducing this means changing the protocol.
+  **Invariant: the per-window protocol carries audio and nothing else.**
+  `transcribe` takes no text argument, so there is no code path by which the
+  transcript can reach the model.
 
-- **Repetition loops** — decoder gets stuck. Mitigation: compression-ratio
-  heuristic (output that gzips too well is looping) + temperature fallback. Note
-  the loop observed above was a *consequence* of prompt echo, not a spontaneous
-  decoder failure; removing the prompt removed it. This mitigation is still
-  unimplemented and still worth having.
+  **Refined on measurement — a *static* prompt is not this bug.** The reasoning
+  above turns on the prompt being dynamic and derived from what the speaker
+  said: that is what makes it the strongest signal on an empty window, and what
+  makes the echo self-reinforce. A fixed command list has neither property, and
+  the difference is measured rather than argued. On `Qwen3-ASR-1.7B-8bit`, with
+  `"Commands: Luna commit, Luna reject, …"` as `system_prompt`:
+
+  | audio | no prompt | with the command list |
+  |---|---|---|
+  | 3s digital silence | `""` | `""` |
+  | 20s noise at −38 dBFS — *the reported echo condition* | `""` | `""` |
+  | speech-like babble | transcribed | **byte-identical** |
+  | 41s of ordinary dictation | — | **byte-identical** |
+  | `Luna went to the store.` + `I will commit the change tomorrow.` | dictation | dictation, no false command |
+
+  And it fixes a command that was silently unreachable: spoken "Luna, rollback"
+  comes back as `Luna, roll back.` — two words, which `command.rs` correctly
+  refuses, since nothing may come between the wake word and the verb. With the
+  hint it is `Luna rollback.` and fires. Verified end to end on synthesized
+  speech: reject then rollback both landed, and the sentence came back.
+
+  So the ban is on the *transcript*, not on the argument. `command::hint` is
+  passed **once, at spawn**, as a CLI flag to the sidecar, specifically so the
+  dangerous shape — per-request text — does not exist to be reached for later.
+  Note this does not contradict "no context biasing" below: the hint is not
+  biasing recognition of arbitrary vocabulary, it is fixing how the model
+  *segments* two known words.
+
+- **Repetition loops** — decoder gets stuck. The compression-ratio heuristic
+  (output that gzips too well is looping) plus temperature fallback is still
+  unimplemented and still worth having. What *is* implemented is the token
+  budget below, which bounds the damage without detecting the loop.
+
+- **A runaway forward pass, from `max_tokens=8192` (fixed)** — reported as a
+  63.6s buffer whose refresh "slowed to 84K", i.e. a ~67s forward pass setting
+  the adaptive tick to ~84s. The session looked dead for over a minute.
+
+  `Qwen3ASRModel.generate` defaults to **`max_tokens=8192`**. At the model's
+  12.5 Hz token rate that is 655 *seconds* of permitted output for any window
+  however short, so a decoder that gets stuck does not fail — it runs to the cap,
+  and the pass takes as long as generating 8192 tokens takes. Nothing in the
+  pipeline bounded it, because the tick stretch is derived *from* `infer_ms` and
+  therefore scales with the failure instead of containing it.
+
+  The budget is now `audio_seconds × 12.5 + 64`. Measured on
+  `Qwen3-ASR-1.7B-8bit`, capped versus the 8192 default on identical audio:
+
+  | audio | budget | capped | default | text |
+  |---|---|---|---|---|
+  | 30.0s | 439 tok | 0.98s | 0.97s | byte-identical (570 chars) |
+  | 63.6s | 859 tok | 1.82s | 1.81s | byte-identical (1030 chars) |
+
+  So a healthy 63.6s pass is **1.8s, not 67s**, the cap never binds on real
+  speech — 859 tokens against ~258 actually emitted, 3.3× headroom — and the
+  worst case drops ~10×. 12.5 is the model's own audio token rate rather than a
+  tuned number, which is why it is the right ceiling: a transcript cannot
+  legitimately need more text tokens per second than the audio carries.
+
+  **The tick was deliberately not clamped.** An obvious fix is a ceiling on the
+  stretch, and it makes things worse: `tick = max(interval, infer × 1.25)` fires
+  the next pass 0.25 × `infer` after the last one *finishes*, so clamping below
+  that starts passes back to back and pins the duty cycle at 100% — the exact
+  cliff §3 exists to stay off. The stretch is right; what was wrong was an
+  unbounded `infer` feeding it. Fix the input, not the response.
 - **Seam artifacts** — dropped/duplicated words at window boundaries. The
   context carry-over that was supposed to address this never worked (see above),
   so if seam artifacts appear, the fix has to come from window overlap or the
@@ -1158,6 +1293,36 @@ sentence recorded without the stutter.
   mid-sentence. `push_hypothesis` now discards it: an empty hypothesis is
   absence of evidence, not evidence of silence.
 
+- **The merge threw away the trim's cut candidates (fixed)** — reported as
+  sentences vanishing from the screen once the buffer passed the threshold, then
+  as `Luna, copy` copying nothing and the session file being empty. Three
+  symptoms, one cause: **the document was empty**, because the trim is the only
+  thing that files text mid-passage (see §6, *The file holds the utterance in
+  flight too*) and the trim was being starved of places to cut.
+
+  `dips` were cleared at every endpoint, including when the audio was retained
+  in `Pending`. A continuation puts that audio back at the *front* of the merged
+  buffer with its pauses exactly where they were, but the record of them was
+  already gone — so a merged buffer offered only its own seam, one candidate per
+  merge, however many sentences it held. §5 merges every ordinary pause, so this
+  is the normal path in a real session, not an edge case. `Pending` now carries
+  its dips and the merge splices them back at their original offsets.
+
+  **The lesson worth keeping is the coupling, not the bug.** The trim was
+  documented as a latency control — "what is bounded is how far behind the
+  transcript falls". It is also the *only* thing that gets text out of process
+  memory during a long passage, so starving it silently disabled the crash
+  safety net. Anything that changes trim policy has to be read as changing
+  persistence policy too.
+
+  Diagnosis note, because it cost two wrong answers: the first reading was
+  "renderer starves the document" (`build_rows` draws the whole live tail before
+  any document rows, which is real but was not this), and the second asserted
+  the text was safe on disk. Both were reasoning without a repro. The repro is
+  cheap — `say` a passage with `[[slnc 1000]]` between sentences so every gap
+  merges, run it under `--simulate --persist`, and poll the session file. Do
+  that first.
+
 ---
 
 ## 8. Layout
@@ -1239,6 +1404,12 @@ end to end on synthesized speech at the current defaults (99 unit tests green):
 | 8s / 12s gap | two sentences, no merge |
 | 42s unbroken passage | trimmed at pauses, 7 clean sentences, no word cut, 72% duty |
 | `kill -9` mid-session, no `--persist` | settled text recovered from the session file |
+| `kill -9` at T+20s of a continuously merging passage, before any trim | 4 sentences recovered, split one per line, with stdout empty as designed |
+| 41s passage, 1s pauses throughout (every gap merges) | file tracks the passage from T+6s; before the fix it held nothing until the first trim at ~T+33s |
+| 80s of continuous speech, `--trim-after-s 10` | buffer peaked at 13.3s against the 20s bound; transcript clean |
+| 63.6s buffer, token budget vs the 8192 default | byte-identical text, 1.82s vs 1.81s — the cap never binds on real speech |
+| `"…will be dropped. Luna, reject. Luna, rollback."` | both fire; the sentence is dropped and restored — `rollback` was unreachable before the vocabulary hint |
+| command list as `system_prompt`, 20s noise / 41s dictation / controls | no echo, byte-identical, no false command |
 | next launch after that kill | announces the orphaned session, naming it and its size |
 | `--resume` | recovers it, continues dictating, **adopts the file in place** — still one file |
 | `--resume ~/mynotes.txt` | loads it, leaves it byte-identical, opens a new session file |

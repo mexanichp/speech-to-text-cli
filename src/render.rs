@@ -42,6 +42,12 @@
 //! | plain text, `│` gutter | settled; only the **speaker** can change it now |
 //! | plain text, no gutter | the speaker committed it |
 //!
+//! Plus one that is about the screen rather than the text: a `⋮` gutter on the
+//! top row means there is more transcript above than fits. The live tail is
+//! never truncated to make room for history — §1 — so on a long buffer the
+//! document scrolls out of view, and this says so instead of letting it vanish
+//! silently.
+//!
 //! Dim still means exactly what it always meant. A speaker rejecting their own
 //! sentence is not the pipeline changing its mind, so plain text keeps its
 //! promise even though a committed sentence can still leave the screen.
@@ -59,6 +65,19 @@ const CURSOR_SHOW: &str = "\x1b[?25h";
 
 /// Marks a sentence the speaker has not committed yet.
 const PENDING_MARK: char = '\u{2502}';
+
+/// Marks the top row when there is more transcript above it than fits.
+///
+/// The live tail is drawn in full and outranks history — that is the §1 stance,
+/// and it is deliberate: a speaker who has not finished has to be able to read
+/// what they are saying. The consequence is that on a long buffer or a short
+/// terminal the document scrolls out of view, and **it used to do so silently**,
+/// which is exactly how an empty document (see §6) went undiagnosed as a
+/// rendering problem for two rounds.
+///
+/// So this is not a cap. Everything live still renders; this only stops the
+/// screen from claiming that what it shows is all there is.
+const MORE_MARK: char = '\u{22ee}';
 
 /// How long a diagnostic holds the status line before the ordinary status
 /// comes back.
@@ -94,6 +113,12 @@ enum Gutter {
     None,
     /// Settled or in flight — `Luna, commit` has not reached it.
     Pending,
+    /// Top row only: there is more transcript above than the screen holds.
+    ///
+    /// It displaces the row's own commit mark, which is the right trade — the
+    /// rows it stands for are off screen entirely, and their absence matters
+    /// more than one visible row's state.
+    More,
 }
 
 struct Row<'a> {
@@ -274,8 +299,15 @@ fn build_rows<'a>(frame: &Frame<'a>, text_w: usize, max_rows: usize) -> Vec<Row<
         }
     }
 
+    // Whether anything the document holds could not be drawn. Tracked rather
+    // than inferred afterwards, because the two ways it happens are different:
+    // the loop below runs out of screen, or the live tail alone already
+    // overflowed it.
+    let mut elided = rows.len() > max_rows;
+
     for sentence in frame.document.iter().rev() {
         if rows.len() >= max_rows {
+            elided = true;
             break;
         }
         let gutter = if sentence.committed {
@@ -291,6 +323,15 @@ fn build_rows<'a>(frame: &Frame<'a>, text_w: usize, max_rows: usize) -> Vec<Row<
 
     rows.truncate(max_rows);
     rows.reverse();
+
+    // The marker replaces the top row's own gutter rather than being prepended
+    // to its text. §7 records why: an elision marker added *outside* the width
+    // budget put a full row exactly on the terminal boundary and armed deferred
+    // wrap. The gutter is already budgeted and already one column plus a space,
+    // so this cannot change any row's width.
+    if elided && let Some(top) = rows.first_mut() {
+        top.gutter = Gutter::More;
+    }
     rows
 }
 
@@ -299,6 +340,7 @@ fn style_row(row: &Row, gutter_w: usize) -> String {
     if gutter_w > 0 {
         match row.gutter {
             Gutter::Pending => out.push_str(&format!("{DIM}{PENDING_MARK}{RESET} ")),
+            Gutter::More => out.push_str(&format!("{DIM}{MORE_MARK}{RESET} ")),
             Gutter::None => out.push_str(&" ".repeat(gutter_w)),
         }
     }
@@ -519,6 +561,64 @@ mod tests {
         assert!(last.contains("still") && last.contains("speaking"), "{last:?}");
         // And the newest history is what got kept above it.
         assert!(style_line(&rows[3].cells).contains("49"));
+    }
+
+    /// History scrolling off is allowed — the live tail outranks it — but it
+    /// must never do so silently. That silence is what made an empty document
+    /// look like a rendering bug for two rounds of diagnosis.
+    #[test]
+    fn history_pushed_off_screen_is_marked_rather_than_hidden() {
+        let doc: Vec<Sentence> = (0..30)
+            .map(|i| sentence(&format!("Sentence number {i}."), true))
+            .collect();
+        let live = Vec::new();
+        let rows = build_rows(&frame(&doc, &live, &live), 40, 5);
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].gutter, Gutter::More, "the top row must say so");
+        assert!(style_row(&rows[0], 2).contains(MORE_MARK));
+        // Only the top row, and the rest keep their own meaning.
+        assert!(rows[1..].iter().all(|r| r.gutter != Gutter::More));
+    }
+
+    /// The case the speaker actually hit: an utterance so long it fills the
+    /// screen on its own. It is still drawn in full — never capped — but the
+    /// document behind it is no longer silently gone.
+    #[test]
+    fn a_live_tail_that_fills_the_screen_still_marks_the_history_behind_it() {
+        let doc = [sentence("Filed earlier.", true)];
+        let committed = words(&"word ".repeat(200));
+        let rows = build_rows(&frame(&doc, &committed, &[]), 40, 4);
+
+        assert_eq!(rows.len(), 4, "the live tail keeps every row it needs");
+        assert_eq!(rows[0].gutter, Gutter::More);
+        assert!(
+            rows.iter().all(|r| r.cells.iter().all(|(w, _)| *w == "word")),
+            "and none of it was dropped to make room for history"
+        );
+    }
+
+    /// A screen that holds everything must not claim otherwise.
+    #[test]
+    fn nothing_is_marked_when_it_all_fits() {
+        let doc = [sentence("One.", true), sentence("Two.", false)];
+        let live = words("still talking");
+        let rows = build_rows(&frame(&doc, &live, &[]), 40, 20);
+        assert!(rows.iter().all(|r| r.gutter != Gutter::More));
+    }
+
+    /// The marker replaces a gutter that was already budgeted, so it cannot
+    /// push a row onto the wrap boundary — the failure §7 records for the last
+    /// elision marker this file had.
+    #[test]
+    fn the_marker_never_widens_a_row() {
+        for width in 2..=24 {
+            let (gutter_w, text_w) = budget(width);
+            let doc: Vec<Sentence> = (0..20).map(|i| sentence(&format!("row {i} here"), i % 2 == 0)).collect();
+            let live = words("tail end of it");
+            let rows = build_rows(&frame(&doc, &live, &[]), text_w, 3);
+            assert_rows_fit(&rows, gutter_w, width);
+        }
     }
 
     #[test]

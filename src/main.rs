@@ -204,6 +204,30 @@ const MAX_GAP_SAMPLES: usize = (audio::TARGET_RATE as usize * 1200) / 1000;
 /// still in the middle of.
 const DIP_FRAMES: usize = 12;
 
+/// Shortest silence recorded as a *possible* cut point: ~64ms.
+///
+/// Deliberately below [`DIP_FRAMES`], so these are not gaps anyone would choose:
+/// 64ms of silence can be the closure of a stop consonant rather than a word
+/// boundary, and cutting there risks clipping one. They are recorded because the
+/// alternative turned out to be worse than a clipped consonant.
+///
+/// D9 says an utterance is never truncated and that a buffer with no gap in it
+/// simply keeps growing. Reported live, that has no bound: a speaker who never
+/// left 190ms drove the buffer to **63.6s**, where a single forward pass took
+/// ~67s and stretched the tick to ~84s. A bad cut is a bad sentence; an
+/// unbounded buffer is a session that stops responding.
+const MIN_DIP_FRAMES: usize = 4;
+
+/// How far past `--trim-after-s` the buffer may go before the trim stops holding
+/// out for a comfortable gap.
+///
+/// Below this only [`DIP_FRAMES`] gaps are eligible, which is D9's quality bar
+/// unchanged. Past it every recorded silence is fair game — longest still
+/// preferred, so this only ever *adds* candidates the trim would otherwise have
+/// had none of. By then the speaker has demonstrably not left a good gap, and
+/// there is no bound on how long waiting for one would take.
+const DESPERATE_TRIM_MULTIPLE: usize = 2;
+
 /// A gap the speaker left inside an utterance: somewhere the buffer may be cut
 /// without slicing a word.
 ///
@@ -241,6 +265,20 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// ended it turns out to have been a hesitation.
 struct Pending {
     audio: Vec<f32>,
+    /// Gaps already found in `audio`, at offsets into it.
+    ///
+    /// Held with the audio rather than discarded at the endpoint, because a
+    /// continuation puts that audio back at the *front* of the merged buffer
+    /// with its pauses exactly where they were. Dropping them left a merged
+    /// buffer with no cut candidates except its own seam — one per merge — so a
+    /// session that merges continuously, which §5 means every ordinary pause
+    /// does, could hold a dozen sentences and offer the trim a handful of places
+    /// to cut instead of every pause in the passage.
+    ///
+    /// That is not a latency bug. The trim is the only thing that files text
+    /// into the document mid-passage, so starving it leaves `Luna, copy` and the
+    /// session file empty of everything the speaker has said.
+    dips: Vec<Dip>,
     /// Dim in the live view, and deliberately not in the document yet: a
     /// continuation re-decodes it and can rewrite every word.
     words: Vec<String>,
@@ -462,11 +500,15 @@ fn main() -> Result<()> {
     }
 
 
+    // The command vocabulary, derived from `--assistant` so a retargeted wake
+    // word is announced too. Fixed for the session and never touched again —
+    // the per-window protocol carries audio and nothing else.
     let mut asr = sidecar::Sidecar::spawn(
         &args.python,
         &args.script,
         &args.model,
         args.language.as_deref(),
+        &command::hint(&args.assistant),
     )
     .context("starting inference sidecar")?;
 
@@ -539,11 +581,31 @@ fn main() -> Result<()> {
             screen.notice(&msg);
         }
 
-        // A no-op unless the document actually changed, which is a few times a
-        // minute rather than per tick. Placed before every `continue` below so
-        // no mutation can reach the end of an iteration unwritten.
+        // Everything the pipeline is holding that the document does not have
+        // yet. Between trims that is the *whole* passage: §5 merges every
+        // ordinary pause, so an utterance never settles and `finalize_window`
+        // deliberately files nothing. Handing it to the store is what keeps a
+        // crash mid-passage from taking minutes of speech with it.
+        let in_flight = match &pending {
+            Some(p) => p.words.join(" "),
+            None => {
+                let mut live = script.committed().join(" ");
+                for word in script.provisional() {
+                    if !live.is_empty() {
+                        live.push(' ');
+                    }
+                    live.push_str(word);
+                }
+                live
+            }
+        };
+
+        // A no-op unless the document or the utterance in flight actually
+        // moved; the latter is rate-limited inside. Placed before every
+        // `continue` below so no mutation can reach the end of an iteration
+        // unwritten.
         if let Some(store) = &mut store
-            && let Some(err) = store.save(script.document(), script.revision())
+            && let Some(err) = store.save(script.document(), script.revision(), &in_flight)
         {
             screen.notice(&err);
         }
@@ -614,7 +676,7 @@ fn main() -> Result<()> {
                     // first frame past the threshold a new gap rather than a
                     // continuation of the last.
                     let run = vad.silence_run();
-                    if run >= DIP_FRAMES {
+                    if run >= MIN_DIP_FRAMES {
                         let started = vad_cursor.saturating_sub(run * FRAME);
                         let dip = Dip {
                             at: started + run * FRAME / 2,
@@ -667,8 +729,8 @@ fn main() -> Result<()> {
             let shift = merged.len();
             merged.extend_from_slice(&window);
 
-            // Everything already recorded now sits `shift` samples later, and
-            // the seam itself is the best cut point in the whole buffer.
+            // Everything recorded since the endpoint now sits `shift` samples
+            // later.
             for dip in &mut dips {
                 dip.at += shift;
             }
@@ -679,8 +741,15 @@ fn main() -> Result<()> {
                     at: held + gap / 2,
                     frames: gap / FRAME,
                 });
-                dips.sort_unstable_by_key(|d| d.at);
             }
+            // The held audio is back at the front of the buffer, so the pauses
+            // found in it are still where they were and are still the only
+            // places it may be cut. These are what a long merged passage is made
+            // of: the seam alone offers one candidate per merge, which is not
+            // enough to keep a continuously merging session inside
+            // `--trim-after-s`.
+            dips.extend(p.dips);
+            dips.sort_unstable_by_key(|d| d.at);
 
             window = merged;
             vad_cursor += shift;
@@ -742,6 +811,10 @@ fn main() -> Result<()> {
                 } else {
                     pending = Some(Pending {
                         audio: std::mem::take(&mut window),
+                        // Taken rather than left to the `dips.clear()` below.
+                        // This audio may come back at the front of a merged
+                        // buffer, and its pauses have to come back with it.
+                        dips: std::mem::take(&mut dips),
                         words: utterance,
                         at: Instant::now(),
                     });
@@ -765,11 +838,21 @@ fn main() -> Result<()> {
         // do not cut at all. An utterance is never truncated; the cost of
         // refusing to cut is latency, which is recoverable, where the cost of
         // cutting mid-word is a mangled transcript, which is not.
+        // Hold out for a comfortable gap until the buffer is far enough past the
+        // threshold that waiting for one costs more than taking a short one.
+        let dip_floor = if window.len() >= trim_after.saturating_mul(DESPERATE_TRIM_MULTIPLE) {
+            MIN_DIP_FRAMES
+        } else {
+            DIP_FRAMES
+        };
+
         if window.len() >= trim_after
             && let Some(cut) = dips
                 .iter()
                 .filter(|d| {
-                    d.at >= MIN_SEGMENT_SAMPLES && window.len() - d.at >= MIN_SEGMENT_SAMPLES
+                    d.frames >= dip_floor
+                        && d.at >= MIN_SEGMENT_SAMPLES
+                        && window.len() - d.at >= MIN_SEGMENT_SAMPLES
                 })
                 // Longest gap wins, latest breaks the tie: the longer a pause,
                 // the more likely it is a sentence boundary rather than a
@@ -879,9 +962,11 @@ fn main() -> Result<()> {
     let tail = script.finalize_window();
     apply(&mut script, &tail, &args.assistant, &mut screen, &mut debounce);
 
-    // One last write, for anything settled on the way out.
+    // One last write, for anything settled on the way out. Nothing is in flight
+    // any more — the tail was just finalized and filed — so this also clears the
+    // partial line any earlier tick left behind.
     if let Some(store) = &mut store {
-        store.save(script.document(), script.revision());
+        store.save(script.document(), script.revision(), "");
     }
 
     // Gives the terminal back, then writes the transcript where it persists.

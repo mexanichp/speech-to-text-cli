@@ -60,11 +60,23 @@ pub struct Sidecar {
 
 impl Sidecar {
     /// Spawns the sidecar and blocks until the model is resident and warm.
-    pub fn spawn(python: &Path, script: &Path, model: &str, language: Option<&str>) -> Result<Self> {
+    /// `prompt` is a fixed vocabulary hint, set **once here** and never per
+    /// request. See `command::hint` for why that distinction is the whole
+    /// safety argument, and §7 for the measurement it overturns.
+    pub fn spawn(
+        python: &Path,
+        script: &Path,
+        model: &str,
+        language: Option<&str>,
+        prompt: &str,
+    ) -> Result<Self> {
         let mut cmd = Command::new(python);
         cmd.arg(script).arg("--model").arg(model);
         if let Some(lang) = language {
             cmd.arg("--language").arg(lang);
+        }
+        if !prompt.is_empty() {
+            cmd.arg("--system-prompt").arg(prompt);
         }
 
         let mut child = cmd
@@ -131,9 +143,11 @@ impl Sidecar {
     /// `Err` means the transport is broken and the session cannot continue.
     /// A window the sidecar merely refused comes back as [`Reply::Failed`].
     ///
-    /// Audio only. There is deliberately no text field: feeding the transcript
-    /// back as a prompt made the model replay it verbatim whenever the window
-    /// held no speech. See the note in `asr_sidecar.py`.
+    /// Audio only. There is deliberately no text field, and that is what keeps
+    /// the transcript away from the model: feeding it back as a prompt made the
+    /// model replay it verbatim whenever the window held no speech. The fixed
+    /// vocabulary hint is passed at [`spawn`](Sidecar::spawn) instead, precisely
+    /// so no per-window text path exists to be misused. See `asr_sidecar.py`.
     pub fn transcribe(&mut self, pcm: &[f32]) -> Result<Reply> {
         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
 
