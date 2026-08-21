@@ -1,9 +1,13 @@
-//! Microphone capture, downmixed to mono and resampled to the 16 kHz f32
-//! contract every ASR component in this pipeline expects.
+//! Audio capture, downmixed to mono and resampled to 16 kHz f32.
 //!
-//! The cpal callback is a real-time context, so it only downmixes and hands
-//! off. Resampling — which allocates and is stateful — happens on its own
-//! thread.
+//! Every component downstream of this module expects that format, so it is the
+//! one place sample rates and channel counts are handled.
+//!
+//! Capture runs on a real-time thread that only downmixes and forwards.
+//! Resampling allocates and is stateful, so it runs on its own thread.
+//!
+//! [`simulate`] substitutes a WAV file for the microphone at wall-clock pace,
+//! which is how the pipeline is exercised end to end without a speaker.
 
 use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,27 +24,18 @@ const RESAMPLE_CHUNK: usize = 1024;
 
 /// Capture chunks buffered between the audio thread and the main loop.
 ///
-/// This is a **latency budget, not a queue size**, and it is load-bearing.
-/// Once it overflows the audio callback drops buffers, and the model is then
-/// handed audio with holes in it — which does not degrade gracefully. Measured,
-/// the same passage comes back as `So. a. bench. run. on silence.` instead of a
-/// sentence, and no amount of catching up afterwards repairs it.
+/// This is a latency budget rather than a queue size. The main loop drains
+/// nothing while blocked in a forward pass, and several passes run off the
+/// regular tick and can land back to back, so the buffer must absorb a burst
+/// of them. At 512 chunks it holds several seconds.
 ///
-/// The main loop consumes one chunk per iteration, so it drains nothing at all
-/// while it is blocked in a forward pass. The tick stretch keeps the steady
-/// state under 100% duty, but three places deliberately run a pass *off* the
-/// tick and can therefore land back to back:
-///
-/// * the final pass at an endpoint,
-/// * the immediate re-decode when a continuation merges,
-/// * the extra pass over the head when the buffer is trimmed.
-///
-/// At 512 chunks this holds several seconds either way — comfortably more than
-/// that burst — so falling behind costs a few seconds of lag that pauses then
-/// give back, instead of costing words outright. Latency is recoverable;
-/// shredded audio is not.
+/// On overflow the capture callback drops buffers, and audio with gaps in it
+/// does not degrade gracefully: the model returns fragments rather than
+/// sentences, and later passes cannot repair it. Lag is recoverable, so this
+/// is sized to trade lag for integrity.
 const CAPTURE_BACKLOG: usize = 512;
 
+/// Live audio source plus the diagnostics raised while producing it.
 pub struct Capture {
     /// 16 kHz mono f32, in arbitrary-sized chunks.
     pub pcm: Receiver<Vec<f32>>,
@@ -52,9 +47,18 @@ pub struct Capture {
     _stream: Option<cpal::Stream>,
 }
 
-/// Feed a WAV file through the pipeline at wall-clock pace, as if it were the
-/// microphone. The only way to exercise capture -> VAD -> commit end to end
-/// without a human speaking.
+/// Feeds a WAV file through the pipeline at wall-clock pace, replacing the
+/// microphone.
+///
+/// Pacing follows an absolute deadline rather than sleeping between sends, so
+/// scheduler delay and send cost do not accumulate. A relative-sleep pacer
+/// makes the pipeline appear slower than realtime when it is keeping up.
+///
+/// Trailing silence is appended so the final utterance reaches an endpoint.
+///
+/// # Errors
+///
+/// Fails if the file cannot be read, or if it is not 16 kHz.
 pub fn simulate(path: &std::path::Path) -> Result<Capture> {
     let mut reader = hound::WavReader::open(path)
         .with_context(|| format!("opening {}", path.display()))?;
@@ -96,22 +100,11 @@ pub fn simulate(path: &std::path::Path) -> Result<Capture> {
     );
 
     let (tx, rx) = bounded::<Vec<f32>>(CAPTURE_BACKLOG);
-    // 20 ms per tick, matching a typical capture callback cadence.
     let step = TARGET_RATE as usize / 50;
 
     std::thread::spawn(move || {
-        // Paced against an absolute schedule, not by sleeping between sends.
-        //
-        // `sleep` guarantees *at least* its argument, so a loop that sleeps 20ms
-        // per chunk drifts by however long each iteration took plus whatever the
-        // scheduler added — and it adds a lot here, because the main thread is
-        // saturating the GPU and a Python process is contending for the CPU.
-        // Measured on a 41.6s file, the relative form took 58s to send, which
-        // made the pipeline look ~40% slower than realtime when it was in fact
-        // keeping up: the harness, not the system under test, was late.
         let start = std::time::Instant::now();
         let mut sent = 0u32;
-        // Trailing silence so the VAD endpoints the final utterance.
         let silence = vec![0.0f32; step];
         let blocks = mono.chunks(step).map(Some).chain((0..40).map(|_| None));
 
@@ -128,7 +121,6 @@ pub fn simulate(path: &std::path::Path) -> Result<Capture> {
         }
     });
 
-    // Nothing runs off-thread here that can raise diagnostics.
     let (_tx, notices) = unbounded::<String>();
 
     Ok(Capture {
@@ -138,6 +130,17 @@ pub fn simulate(path: &std::path::Path) -> Result<Capture> {
     })
 }
 
+/// Opens an input device and starts capture.
+///
+/// # Parameters
+///
+/// - `device_name`: substring matched against device names; `None` selects the
+///   system default.
+///
+/// # Errors
+///
+/// Fails if no host input device matches, or if the stream cannot be built or
+/// started.
 pub fn start(device_name: Option<&str>) -> Result<Capture> {
     let host = cpal::default_host();
 
@@ -183,8 +186,6 @@ pub fn start(device_name: Option<&str>) -> Result<Capture> {
                     .map(|f| f.iter().sum::<f32>() / channels as f32)
                     .collect()
             };
-            // Dropping under backpressure is correct here: better to lose a
-            // buffer than to block the audio thread.
             let _ = raw_tx.try_send(mono);
         },
         move |err| {
@@ -208,8 +209,12 @@ pub fn start(device_name: Option<&str>) -> Result<Capture> {
     })
 }
 
+/// Resamples mono chunks from `in_rate` to [`TARGET_RATE`] until the input
+/// channel closes.
+///
+/// Runs off the capture thread because resampling allocates and holds state,
+/// neither of which is permitted in a real-time audio callback.
 fn resample_loop(raw: Receiver<Vec<f32>>, out: Sender<Vec<f32>>, in_rate: u32) -> Result<()> {
-    // Already at the target rate: pass through untouched.
     if in_rate == TARGET_RATE {
         for chunk in raw {
             if out.send(chunk).is_err() {

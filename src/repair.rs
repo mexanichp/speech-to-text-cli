@@ -1,87 +1,60 @@
-//! Self-repair: the speaker starts a word, hears it come out wrong, and says
-//! it again — "the regularing… regular expression".
+//! Removal of self-repairs, where a speaker restarts a word they misspoke.
 //!
-//! Qwen3-ASR transcribes the disfluency verbatim, so the reparandum lands in
-//! the transcript unless something takes it out. Measured on
-//! `Qwen3-ASR-1.7B-8bit`:
+//! The recogniser transcribes disfluency verbatim, so "the regularing… regular
+//! expression" reaches the transcript with the false start intact. [`repair`]
+//! drops the false start and keeps the correction.
 //!
-//! | spoken | transcript |
-//! |---|---|
-//! | "The regularing · regular expression is broken." | `The regularing regular expression is broken.` |
-//! | "I need to conf · configure the server today." | `I need to conf configure the server today.` |
+//! # Detection rule
 //!
-//! This is the same problem the wake-word command grammar had — telling an edit
-//! apart from dictation with no acoustic signal to lean on — but without the
-//! wake word to make it easy, because nobody says "admin" before stuttering.
-//! The whole defence is therefore in the pair rule below, and the bar is the
-//! same one the commands were held to: **a near-miss is dictation, never a
-//! guess.** Deleting a word the speaker meant to keep is much worse than
-//! leaving a stutter on screen for them to edit later.
+//! A pair qualifies only when one word is a strict prefix of the other. Two
+//! signals that appear usable are not: the recogniser does not punctuate the
+//! hesitation seam, and edit distance cannot separate `form`/`from` or
+//! `quiet`/`quite` from genuine repairs.
 //!
-//! # Why not punctuation, and why not edit distance
+//! Containment alone is insufficient, and the two directions fail differently,
+//! so each has its own stem threshold:
 //!
-//! The obvious signal is the pause: the model writes hesitation as a comma. It
-//! does not, here. Measured, the repair seam came back *unpunctuated*
-//! (`regularing regular`) while an innocent control got the comma
-//! (`at work, working late`). Punctuation is anti-correlated with repair on
-//! this model, so it is not usable.
+//! - Backtrack ("regularing" then "regular"). English rarely places a word
+//!   before its own prefix; the systematic exception is a plural noun meeting
+//!   its verb ("the tests test the parser"), which the `-s`/`-es` exclusion
+//!   covers. A short stem therefore suffices.
+//! - Extension ("conf" then "configure"). English does place a word before its
+//!   own derivation ("at work working late"), so this requires a longer stem
+//!   and an extension that is not a plain inflection.
 //!
-//! Edit distance is worse than useless. `form`/`from`, `quiet`/`quite`,
-//! `trial`/`trail`, `casual`/`causal` are all one or two edits apart, and "the
-//! form from the office" is an ordinary thing to say. So the rule is **prefix
-//! containment only** — one word must be a strict prefix of the other, which
-//! `form`/`from` is not.
+//! # Limitations
 //!
-//! # The asymmetry
+//! Exact repetition ("the the") is never treated as a repair, because "I had
+//! had enough" is ordinary English. Substitutions that share no prefix
+//! ("Tuesday… Wednesday") are not detectable here. Truncations shorter than
+//! [`MIN_STEM_EXTENSION`] are not caught, since catching them would also catch
+//! "just"/"justify".
 //!
-//! Containment alone still is not enough, and the two directions fail
-//! differently, so they get different thresholds.
-//!
-//! **Longer first** — "regularing" then "regular". English essentially never
-//! puts a word immediately before its own prefix. The one systematic exception
-//! is a plural noun meeting its verb: "the tests test the parser", "these
-//! changes change the behavior" — both measured, both real. That exception is
-//! exactly the `-s`/`-es` extension, so excluding it is enough and the stem can
-//! be short.
-//!
-//! **Shorter first** — "conf" then "configure". This direction is genuinely
-//! ambiguous, because English *does* put a word before its own derivation: "at
-//! work, working late" (measured), "the main maintenance window", "just justify
-//! the text". So it needs both a longer stem and an extension that is not a
-//! plain inflection. The cost is that four-letter truncations like
-//! "conf"/"configure" are not caught; that is deliberate, since catching them
-//! would also catch "just"/"justify".
-//!
-//! # Not handled, on purpose
-//!
-//! A word repeated exactly — "the the" — is left alone. It is the commonest
-//! disfluency of all, but "I had had enough" and "he said that that was fine"
-//! are ordinary English, and there is no way to separate them here. The
-//! speaker asked for a correction *to a new word*, and this only does that.
+//! A false positive deletes a word the speaker intended to keep, which is worse
+//! than leaving a visible stutter, so an ambiguous pair is treated as
+//! dictation.
 
 use crate::text::normalize;
 
-/// Shortest stem for a backtrack ("regularing" -> "regular").
+/// Shortest stem accepted for a backtrack, in characters.
 ///
-/// Short because the direction is already safe: the plural-verb exception is
-/// excluded below, and nothing else in English lands a word directly before its
-/// own prefix.
+/// "regularing" then "regular". Short because [`PLURAL`] already excludes the
+/// only systematic counterexample in this direction.
 const MIN_STEM_BACKTRACK: usize = 4;
 
-/// Shortest stem for an extension ("regul" -> "regular").
+/// Shortest stem accepted for an extension, in characters.
 ///
-/// Longer than the backtrack because this direction has real counterexamples,
-/// and every one found is a four-letter word: `work`/`working`,
-/// `just`/`justify`, `main`/`maintenance`, `data`/`database`, `test`/`tests`.
-/// Five cuts all of them.
+/// "conf" then "configure". Longer than [`MIN_STEM_BACKTRACK`] because this
+/// direction has real counterexamples — `work`/`working`, `just`/`justify`,
+/// `main`/`maintenance` — all of which are four letters.
 const MIN_STEM_EXTENSION: usize = 5;
 
-/// Extensions that make a backtrack ordinary English rather than a repair:
-/// a plural noun followed by its verb, as in "the tests test the parser".
+/// Suffixes that make a backtrack ordinary English: a plural noun followed by
+/// its verb, as in "the tests test the parser".
 const PLURAL: &[&str] = &["s", "es"];
 
-/// Extensions that make an extension ordinary English rather than a repair —
-/// "at work working late", "this test tests the parser".
+/// Suffixes that make an extension ordinary English, as in "at work working
+/// late".
 const INFLECTION: &[&str] = &[
     "s", "es", "ed", "d", "ing", "er", "est", "ly", "ness", "ment",
 ];
@@ -93,16 +66,17 @@ const FILLER: &[&str] = &["uh", "um", "er", "erm", "ah", "hmm", "mm", "sorry"];
 /// Longest run of hesitation allowed between the two halves of a repair.
 const MAX_INTERREGNUM: usize = 3;
 
-/// Drop reparandums, keeping the correction.
+/// Removes false starts, keeping each correction.
 ///
-/// A pure function of one hypothesis, which is what makes it safe to run on
-/// provisional text. The sliding window re-decodes the same audio every tick,
-/// so the repair sits in every hypothesis from the moment it is spoken; running
-/// this twice gives the same answer, and a re-decode that no longer hears the
-/// false start simply stops dropping it, with nothing to undo.
+/// Pure and idempotent with respect to one hypothesis, which is what makes it
+/// safe on provisional text: the sliding window re-decodes the same audio every
+/// tick, so applying this repeatedly yields the same result, and a later decode
+/// that no longer contains the false start simply stops dropping it.
 ///
-/// Never returns an empty list for a non-empty one: the correction is always
-/// kept, only what it replaced is dropped.
+/// # Returns
+///
+/// The words with reparandums removed. Never empty for a non-empty input, as
+/// only the replaced words are dropped.
 pub fn repair<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
 
@@ -111,7 +85,6 @@ pub fn repair<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
         if let Some(at) = kept.len().checked_sub(pause + 1)
             && is_revision(&kept[at], word)
         {
-            // Take the false start and the hesitation after it with it.
             kept.truncate(at);
         }
         kept.push(word.to_string());
@@ -120,34 +93,38 @@ pub fn repair<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     kept
 }
 
-/// Is `b` the speaker's second attempt at `a`?
+/// Reports whether `b` is a second attempt at `a`.
+///
+/// Requires strict prefix containment in either direction, subject to the stem
+/// thresholds and inflection exclusions described in the module documentation.
+/// Comparison is on normalized forms, and lengths count characters rather than
+/// bytes so the thresholds hold outside ASCII.
 fn is_revision(a: &str, b: &str) -> bool {
     let (a, b) = (normalize(a), normalize(b));
 
-    // Digits are not stutters. "2020 2021" shares no prefix anyway, but "20"
-    // followed by "2020" would, and a spoken figure is not a repair.
     if a.is_empty() || a == b || !is_word(&a) || !is_word(&b) {
         return false;
     }
 
-    // Characters, not bytes: this is a threshold on how much word the two share,
-    // and `len()` would make it five times looser on any script outside ASCII.
     if let Some(extension) = a.strip_prefix(&b) {
-        // "regularing" then "regular".
         return b.chars().count() >= MIN_STEM_BACKTRACK && !PLURAL.contains(&extension);
     }
     if let Some(extension) = b.strip_prefix(&a) {
-        // "regul" then "regular".
         return a.chars().count() >= MIN_STEM_EXTENSION && !INFLECTION.contains(&extension);
     }
     false
 }
 
+/// Reports whether a normalized token is alphabetic, excluding numerals from
+/// the pair rule: spoken figures share prefixes without being repairs.
 fn is_word(normalized: &str) -> bool {
     !normalized.is_empty() && normalized.chars().all(char::is_alphabetic)
 }
 
-/// How many trailing words of `kept` are hesitation rather than dictation.
+/// Counts trailing words of `kept` that are hesitation rather than dictation.
+///
+/// These may separate a false start from its correction without breaking the
+/// pair, up to [`MAX_INTERREGNUM`].
 fn interregnum(kept: &[String]) -> usize {
     let mut n = 0;
     while n < MAX_INTERREGNUM {
@@ -155,8 +132,6 @@ fn interregnum(kept: &[String]) -> usize {
             break;
         };
 
-        // "I mean" is the canonical spoken repair marker. "mean" on its own is
-        // an ordinary verb, so the "I" is required.
         let preceded_by_i = kept
             .len()
             .checked_sub(n + 2)
@@ -224,19 +199,15 @@ mod tests {
     #[test]
     fn ordinary_english_is_untouched() {
         for line in [
-            // Plural noun meeting its verb — the whole reason -s is excluded.
             "These changes change the behavior of the parser.",
             "The tests test the parser thoroughly.",
             "The results result from a bad merge.",
-            // A word before its own derivation.
             "He was at work, working late on the report.",
             "The main maintenance window is on Sunday.",
             "Just justify the text and be done.",
             "This test tests the parser.",
-            // One or two edits apart, but neither contains the other.
             "Take the form from the office.",
             "That is not quiet quite right.",
-            // Short shared prefixes that mean nothing.
             "I found one online store.",
             "Put the car carpet in the hall.",
             "He did it for form's sake.",
@@ -286,7 +257,6 @@ mod tests {
     #[test]
     fn stem_thresholds_are_measured_in_characters() {
         assert_eq!(fix("\u{4e2d}\u{56fd} \u{4e2d}\u{56fd}\u{4eba}"), "\u{4e2d}\u{56fd} \u{4e2d}\u{56fd}\u{4eba}");
-        // Four Cyrillic characters is under the backtrack stem, as for ASCII.
         assert_eq!(fix("\u{0440}\u{0435}\u{0433} \u{0440}\u{0435}\u{0433}\u{0443}"), "\u{0440}\u{0435}\u{0433} \u{0440}\u{0435}\u{0433}\u{0443}");
     }
 

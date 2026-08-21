@@ -1,132 +1,104 @@
-//! Spoken editing commands: "Luna, commit" and "Luna, reject".
+//! Parsing of spoken editing commands from a finalized utterance.
 //!
-//! The wake word is back, and this time it is not competing with self-repair —
-//! the two solve different problems. `repair.rs` fixes a word the speaker
-//! stumbled over, which needs no command because saying it again *is* the
-//! signal. These are document operations — keep what I said, throw away what I
-//! said — and there is no acoustic signal for those at all. Nothing short of a
-//! wake word can express them, which is exactly why the wake word earns its
-//! place here and did not earn it there.
+//! A command is the wake word immediately followed by a verb. Nothing may come
+//! between them, and matching is done on normalized forms, so the comma in
+//! "Luna, delete" is punctuation the recogniser chose and is never seen here.
 //!
-//! # Why detection happens on finalized utterances only
+//! # Command scopes
 //!
-//! `repair()` is safe to run on provisional text because it is pure: the same
-//! false start sits in every hypothesis, so re-deriving the edit each tick is
-//! idempotent. **Commands are not pure.** `Reject` destroys a sentence, and the
-//! sliding window re-decodes the same audio every 500ms — running it per
-//! hypothesis would delete the document one sentence per tick.
+//! `delete` and `discard` both remove one sentence and differ only in reach.
+//! `delete` takes the newest sentence in the document, however long ago it was
+//! filed. `discard` takes the newest sentence of the utterance in flight and
+//! can reach nothing older; said with nothing in flight it removes nothing
+//! rather than falling through to the transcript. That bound is what makes
+//! `discard` safe to say without looking at the screen.
 //!
-//! So a command fires only when the utterance is finalized, and the audio that
-//! carried it is then dropped rather than retained for continuation. Those two
-//! rules together are what make a command fire exactly once. See the
-//! `Pending` handling in `main.rs`.
+//! # Detection is restricted to finalized utterances
 //!
-//! # The matching rule
+//! [`crate::repair`] may run on provisional text because it is pure. Commands
+//! are not: they destroy text, and the sliding window re-decodes the same audio
+//! every tick, so per-hypothesis detection would empty the document one
+//! sentence per tick.
 //!
-//! Wake word immediately followed by the verb, compared through
-//! [`normalize`], which is what makes "Luna, commit" and "Luna commit"
-//! the same input. Nothing may come between them.
+//! Two rules together make a command fire exactly once. It is parsed only from
+//! a finalized utterance, and the audio carrying it is dropped rather than
+//! retained for continuation, since retention is the only thing that could
+//! replay it.
 //!
-//! That is deliberately strict, and the asymmetry justifies it: a **missed**
-//! command costs the speaker one repetition, while a **false** command deletes
-//! text they meant to keep. So this holds the same bar as `repair.rs` — a
-//! near-miss is dictation, never a guess — and pays for it in the direction
-//! that is merely annoying rather than destructive.
+//! # Matching bias
 //!
-//! # The one thing that is not a near-miss
+//! Strictness is asymmetric by design: a missed command costs one repetition,
+//! whereas a false command destroys text the speaker meant to keep. A near-miss
+//! is therefore treated as dictation.
 //!
-//! A third-person `-s` on the verb is the *same* command. Observed live, a
-//! spoken "Luna, reject" comes back from the model as `Luna rejects.` — the
-//! speaker said the verb and the model conjugated it, so treating that as
-//! dictation punishes them for a transcription they cannot see and cannot
-//! influence. It is also the one failure the wake word cannot rescue, because
-//! they did say the wake word.
-//!
-//! It does widen the false-command surface, and honestly: "Luna rejects the
-//! offer." is now a reject. That is the cost of the wake word being a name,
-//! and it is bounded rather than open-ended — `--assistant` retargets it,
-//! `Debounce` stops a repeat compounding it, and `rollback` takes it back.
-//! What was **not** widened is the past and progressive: "Luna committed" and
-//! "Luna rejecting" stay dictation, because those are plausible things to say
-//! *about* someone called Luna in a way the bare present tense is not.
+//! The single exception is a third-person `-s` on the verb, which is the same
+//! command. The recogniser conjugates a spoken "Luna, delete" into "Luna
+//! deletes" often enough to matter, and rejecting that would punish the speaker
+//! for a transcription they can neither see nor influence. Past and progressive
+//! forms remain dictation, since those are plausible things to say about a
+//! person.
 
 use crate::text::{close_sentence, normalize};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// An instruction parsed from a finalized utterance.
 pub enum Command {
-    /// Keep everything settled so far.
-    Commit,
-    /// Drop the most recent sentence, whatever state it was in — including one
-    /// already committed.
-    Reject,
+    /// Drop the most recent sentence in the document.
+    Delete,
+    /// Drop the newest sentence of the utterance in flight. Cannot reach past
+    /// the current breath; with nothing in flight it removes nothing.
+    Discard,
+    /// File what this utterance said and end the settle now.
+    Keep,
     /// Throw away the whole document.
     Clear,
-    /// Put the kept text on the system clipboard.
+    /// Put the transcript on the system clipboard.
     Copy,
     /// Undo the last thing that removed text.
     Rollback,
 }
 
-/// Every verb, in the order they are announced to the model.
+/// Every verb, in the order they are announced to the recogniser.
 ///
-/// Kept beside [`Command::exact`] rather than derived from it, with a test below
-/// that fails if anything here stops parsing — the two must not drift, because a
-/// verb the model is told about but the parser does not know is worse than one
-/// it was never told about.
-const VERBS: [&str; 6] = ["commit", "reject", "clear", "copy", "undo", "rollback"];
+/// Maintained beside [`Command::exact`] rather than derived from it, with a
+/// test that fails if any entry stops parsing. A verb the recogniser is told
+/// about but the parser does not know is worse than one it never heard of.
+///
+/// A short list is safer twice over: each entry is a phrase the recogniser is
+/// primed with before it hears anything, and each is an ordinary English word
+/// that a false match could destroy text with. Every verb here changes the
+/// transcript, which is the requirement for inclusion.
+const VERBS: [&str; 7] = [
+    "delete", "discard", "keep", "clear", "copy", "undo", "rollback",
+];
 
-/// The command vocabulary as one line, for the ASR model to be told about.
+/// Formats the command vocabulary as a single hint line for the recogniser.
 ///
-/// # This is the exception to "the sidecar receives audio and nothing else"
+/// Passed once at spawn, never per request. The distinction matters: a prompt
+/// derived from what the speaker said is replayed verbatim on any window
+/// holding no speech, and self-reinforces as the echo is committed and returns
+/// in the next prompt. This prompt is fixed at startup, cannot grow, and cannot
+/// contain dictation.
 ///
-/// §7 forbids feeding text to the model, on a measurement: the **transcript** as
-/// `system_prompt` was replayed verbatim whenever a window held no speech, and
-/// it self-reinforced because the echo was committed and came back in the next
-/// prompt. That reasoning turns on the prompt being *dynamic and derived from
-/// what the speaker said*. This one is neither, and the difference is measurable
-/// rather than argued — on `Qwen3-ASR-1.7B-8bit`:
-///
-/// | case | no prompt | with this |
-/// |---|---|---|
-/// | 20s of noise at −38 dBFS | `""` | `""` — no echo |
-/// | 41s of ordinary dictation | — | byte-identical |
-/// | `Luna went to the store.` | dictation | dictation — no false command |
-/// | spoken "Luna, rollback" | `Luna, roll back.` | `Luna rollback.` |
-///
-/// That last row is why it earns its place. `roll back` is two words, so the
-/// parser correctly refuses it — nothing may come between the wake word and the
-/// verb — and the speaker has no way to see why their command did nothing.
-///
-/// The invariant survives in a stronger form: this is passed **once, at spawn**,
-/// from configuration. The per-window protocol still carries audio and nothing
-/// else, so no code path exists by which the transcript could reach the model.
+/// It earns its place by fixing verbs the recogniser otherwise splits, such as
+/// "rollback" arriving as two words, which the parser correctly refuses with no
+/// way for the speaker to see why.
 pub fn hint(wake: &str) -> String {
     let spoken: Vec<String> = VERBS.iter().map(|verb| format!("{wake} {verb}")).collect();
     format!("Commands: {}.", spoken.join(", "))
 }
 
 impl Command {
-    /// The verb as spoken, or as the model chose to write it.
+    /// Parses a verb as spoken, or as the recogniser chose to write it.
     ///
-    /// A third-person `-s` counts as the same command, and that is a
-    /// transcription concern rather than a grammar: observed live, a spoken
-    /// "Luna, reject" comes back as `Luna rejects.` often enough to matter.
-    /// The speaker said the verb; the model conjugated it. Refusing that
-    /// reading would mean the command silently fails for reasons invisible to
-    /// the person saying it — the one failure the wake word cannot help with,
-    /// since they *did* say the wake word.
-    ///
-    /// Only the `-s` inflection, and deliberately not the rest. "Luna
-    /// committed" and "Luna rejecting" stay dictation: a past or progressive
-    /// form is a plausible thing to say *about* someone called Luna, where the
-    /// present tense following the name directly is not — and a false command
-    /// deletes text.
+    /// Accepts the third-person `-s` form, which is a transcription artefact
+    /// rather than a different word: the speaker said the verb and the
+    /// recogniser conjugated it. Past and progressive forms are rejected, since
+    /// those are plausible things to say about a person bearing the wake word
+    /// as a name.
     fn from_verb(word: &str) -> Option<Self> {
         let word = normalize(word);
         Self::exact(&word).or_else(|| {
-            // Every stem the word could be an `-s` form of, not just the first
-            // rule that fires: "copies" needs the `y`, "undoes" needs the `e`
-            // kept, and a verb ending in `e` would need it kept too.
             [
                 word.strip_suffix("ies").map(|stem| format!("{stem}y")),
                 word.strip_suffix("es").map(str::to_string),
@@ -138,17 +110,14 @@ impl Command {
         })
     }
 
+    /// Parses a verb in its exact spoken form.
     fn exact(word: &str) -> Option<Self> {
         match word {
-            "commit" => Some(Self::Commit),
-            "reject" => Some(Self::Reject),
+            "delete" => Some(Self::Delete),
+            "discard" => Some(Self::Discard),
+            "keep" => Some(Self::Keep),
             "clear" => Some(Self::Clear),
             "copy" => Some(Self::Copy),
-            // Two words for one command, which is otherwise not something this
-            // module does. "rollback" is the name the operation has everywhere
-            // else here; "undo" is the one people actually say out loud. Both
-            // still require the wake word immediately before them, so the extra
-            // surface costs nothing.
             "rollback" | "undo" => Some(Self::Rollback),
             _ => None,
         }
@@ -157,21 +126,24 @@ impl Command {
 
 /// One piece of a finalized utterance: dictation, or an instruction.
 #[derive(Debug, PartialEq, Eq)]
+/// One piece of a finalized utterance: dictation, or an instruction.
 pub enum Segment {
     Text(Vec<String>),
     Run(Command),
 }
 
-/// Split a finalized utterance into dictation and commands, in spoken order.
+/// Splits a finalized utterance into dictation and commands, in spoken order.
 ///
-/// Order is preserved rather than commands being hoisted, because it is the
-/// only reading that stays predictable when both appear in one breath:
-/// "That's the wrong sentence. Luna, reject." has to file the text *before* the
-/// reject reaches it, or the reject deletes the wrong thing entirely.
+/// Order is preserved rather than commands being hoisted, because that is the
+/// only reading that stays predictable when both appear in one breath: text
+/// preceding a `delete` must be filed before the delete reaches it.
 ///
-/// An empty or punctuation-only wake word never matches. `normalize` maps both
-/// to `""`, and so would any word with no alphanumerics in it, so without the
-/// guard `--assistant ""` would fire on every stray comma.
+/// Dictation terminated by a command is closed with [`close_sentence`], since
+/// the words that followed were provably not part of it. Text appearing after a
+/// command is left alone, as nothing establishes that it ended.
+///
+/// A wake word with no alphanumerics never matches, which would otherwise fire
+/// on every stray punctuation token.
 pub fn split(words: &[String], wake: &str) -> Vec<Segment> {
     let wake = normalize(wake);
     if wake.is_empty() {
@@ -190,14 +162,6 @@ pub fn split(words: &[String], wake: &str) -> Vec<Segment> {
         match command {
             Some(cmd) => {
                 if !text.is_empty() {
-                    // The speaker stopped dictating here — what came next was
-                    // an instruction — so the passage ends here even if the
-                    // model punctuated it as running on. It does exactly that:
-                    // the merge in `main.rs` hands it one buffer holding both
-                    // halves, and measured, "This is my first sentence."
-                    // followed by "Luna, commit" comes back as
-                    // `This is my first sentence, Luna, commit.` Removing the
-                    // command then leaves the comma dangling.
                     let mut done = std::mem::take(&mut text);
                     close_sentence(&mut done);
                     if !done.is_empty() {
@@ -220,61 +184,35 @@ pub fn split(words: &[String], wake: &str) -> Vec<Segment> {
     out
 }
 
-/// How long a text-removing command suppresses a repeat of itself.
+/// The wake word in the form the parser compares against.
 ///
-/// Sized from the failure it prevents. The speaker cannot see a command take
-/// effect until the utterance ends, so a repetition inside roughly one reaction
-/// time is the *same* intention said twice — and taking it literally deletes a
-/// second sentence they never meant to lose.
-///
-/// Measured on synthesized speech, "Luna, reject." twice with a 700ms gap
-/// between them lands the two firings ~1.7s apart, because 700ms of silence is
-/// past `--endpoint-ms` and therefore two separate utterances. Three seconds
-/// covers that comfortably while still letting a deliberate second reject
-/// through after a beat.
-const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Suppresses a destructive command repeated before the speaker could have seen
-/// the first one land.
-///
-/// Only `Reject` and `Clear` are guarded. `Rollback` is deliberately not:
-/// saying "undo, undo, undo" is how a run of rejects gets walked back out, so
-/// there the repetition *is* the intention. `Commit` and `Copy` remove nothing,
-/// and repeating them is harmless.
-#[derive(Default)]
-pub struct Debounce {
-    last: Option<(Command, std::time::Instant)>,
+/// Exposed so a caller can verify at startup that the configured name can match
+/// anything. A name of punctuation alone normalizes to empty and would make
+/// every command silently unreachable.
+pub fn normalized_name(wake: &str) -> String {
+    normalize(wake)
 }
 
-impl Debounce {
-    /// Should this command run? Records it as the newest when it may.
-    ///
-    /// `now` is a parameter rather than read inside so the window is testable
-    /// without sleeping.
-    pub fn allows(&mut self, command: Command, now: std::time::Instant) -> bool {
-        let guarded = matches!(command, Command::Reject | Command::Clear);
-
-        if guarded
-            && let Some((previous, at)) = self.last
-            && previous == command
-            && now.duration_since(at) < REPEAT_WINDOW
-        {
-            // Deliberately re-stamped: a burst of five stays suppressed as one
-            // rather than letting every second repeat through.
-            self.last = Some((command, now));
-            return false;
-        }
-
-        self.last = guarded.then_some((command, now));
-        true
-    }
+/// Reports whether the assistant is named anywhere in these words.
+///
+/// Used to decline an action, never to decline to look. Logical commitment
+/// consults this before filing text early: filing a wake word as dictation puts
+/// it in the transcript permanently, before the endpoint can read it as an
+/// instruction.
+///
+/// Deliberately coarser than [`has_command`], because a wake word whose verb
+/// has not yet been decoded is a command in progress. A false positive delays
+/// one filing; a false negative files a word that should have been a command.
+pub fn names(words: &[String], wake: &str) -> bool {
+    let wake = normalize(wake);
+    !wake.is_empty() && words.iter().any(|w| normalize(w) == wake)
 }
 
-/// Does this utterance carry an instruction?
+/// Reports whether a finalized utterance carries an instruction.
 ///
 /// The caller needs this before deciding whether to retain the audio for a
-/// possible continuation: an utterance holding a command must never be replayed
-/// into a later window, or the command fires a second time.
+/// possible continuation: audio holding a command must never be replayed into a
+/// later window, or the command fires twice.
 pub fn has_command(words: &[String], wake: &str) -> bool {
     split(words, wake)
         .iter()
@@ -301,10 +239,10 @@ mod tests {
     /// both spoken forms are the same command.
     #[test]
     fn the_comma_is_optional() {
-        assert_eq!(split_str("Luna, commit"), vec![Segment::Run(Command::Commit)]);
-        assert_eq!(split_str("Luna commit"), vec![Segment::Run(Command::Commit)]);
-        assert_eq!(split_str("Luna, reject."), vec![Segment::Run(Command::Reject)]);
-        assert_eq!(split_str("LUNA COMMIT"), vec![Segment::Run(Command::Commit)]);
+        assert_eq!(split_str("Luna, copy"), vec![Segment::Run(Command::Copy)]);
+        assert_eq!(split_str("Luna copy"), vec![Segment::Run(Command::Copy)]);
+        assert_eq!(split_str("Luna, delete."), vec![Segment::Run(Command::Delete)]);
+        assert_eq!(split_str("LUNA COPY"), vec![Segment::Run(Command::Copy)]);
     }
 
     /// The ordinary case: a thought, a pause, then the instruction. The merge
@@ -312,29 +250,29 @@ mod tests {
     #[test]
     fn text_before_a_command_is_kept_and_ordered_first() {
         assert_eq!(
-            split_str("This is my sentence. Luna, commit"),
-            vec![text("This is my sentence."), Segment::Run(Command::Commit)]
+            split_str("This is my sentence. Luna, copy"),
+            vec![text("This is my sentence."), Segment::Run(Command::Copy)]
         );
     }
 
-    /// Order is the whole point. If the reject were hoisted ahead of the text
+    /// Order is the whole point. If the delete were hoisted ahead of the text
     /// it would delete the sentence *before* the one the speaker just finished.
     #[test]
     fn text_after_a_command_stays_after_it() {
         assert_eq!(
-            split_str("Luna, reject. Let me try again."),
-            vec![Segment::Run(Command::Reject), text("Let me try again.")]
+            split_str("Luna, delete. Let me try again."),
+            vec![Segment::Run(Command::Delete), text("Let me try again.")]
         );
     }
 
-    /// Measured end to end. The merge hands the model one buffer holding the
-    /// sentence and the instruction, so it runs them together and commas the
-    /// seam; removing the command must not leave that comma behind.
+    /// A merged buffer holding a sentence and an instruction is punctuated as
+    /// running on, so removing the command must not leave the seam comma
+    /// behind.
     #[test]
     fn the_seam_comma_the_merge_creates_is_closed() {
         assert_eq!(
-            split_str("This is my first sentence, Luna, commit."),
-            vec![text("This is my first sentence."), Segment::Run(Command::Commit)]
+            split_str("This is my first sentence, Luna, copy."),
+            vec![text("This is my first sentence."), Segment::Run(Command::Copy)]
         );
     }
 
@@ -343,131 +281,61 @@ mod tests {
     #[test]
     fn text_after_a_command_is_not_force_terminated() {
         assert_eq!(
-            split_str("Luna, reject. and then I kept talking"),
+            split_str("Luna, delete. and then I kept talking"),
             vec![
-                Segment::Run(Command::Reject),
+                Segment::Run(Command::Delete),
                 text("and then I kept talking")
             ]
         );
     }
 
-    /// Parsing stays a faithful transcription of what was said. Suppressing a
-    /// repeat is `Debounce`'s job, because the repeat usually arrives in a
-    /// *later* utterance — 700ms of silence is past `--endpoint-ms` — which
-    /// this function never gets to see.
+    /// Every command heard is reported. Repeats are not collapsed here or
+    /// downstream, and could not be collapsed here in any case: a repeat usually
+    /// arrives in a later utterance, and this sees only one.
     #[test]
     fn parsing_reports_every_command_it_hears() {
         assert_eq!(
-            split_str("Luna reject Luna reject"),
-            vec![Segment::Run(Command::Reject), Segment::Run(Command::Reject)]
+            split_str("Luna delete Luna delete"),
+            vec![Segment::Run(Command::Delete), Segment::Run(Command::Delete)]
         );
         assert_eq!(
-            split_str("Luna commit Luna copy"),
-            vec![Segment::Run(Command::Commit), Segment::Run(Command::Copy)]
+            split_str("Luna clear Luna copy"),
+            vec![Segment::Run(Command::Clear), Segment::Run(Command::Copy)]
         );
     }
 
     #[test]
     fn commands_separated_by_dictation_are_distinct() {
         assert_eq!(
-            split_str("Luna, reject. A new sentence. Luna, reject."),
+            split_str("Luna, delete. A new sentence. Luna, delete."),
             vec![
-                Segment::Run(Command::Reject),
+                Segment::Run(Command::Delete),
                 text("A new sentence."),
-                Segment::Run(Command::Reject)
+                Segment::Run(Command::Delete)
             ]
         );
     }
 
-    mod debounce {
-        use super::*;
-        use std::time::{Duration, Instant};
-
-        /// The case this exists for: the speaker repeats because they have not
-        /// seen the first one land, and the second would delete a sentence they
-        /// never meant to lose.
-        #[test]
-        fn a_repeat_inside_the_window_is_suppressed() {
-            let mut d = Debounce::default();
-            let t0 = Instant::now();
-
-            assert!(d.allows(Command::Reject, t0));
-            assert!(!d.allows(Command::Reject, t0 + Duration::from_millis(1700)));
-            assert!(!d.allows(Command::Reject, t0 + Duration::from_millis(2900)));
-        }
-
-        /// A burst must collapse to one, not to every other one. Each repeat
-        /// re-stamps, so the window slides forward.
-        #[test]
-        fn a_long_burst_stays_suppressed_throughout() {
-            let mut d = Debounce::default();
-            let t0 = Instant::now();
-            assert!(d.allows(Command::Reject, t0));
-
-            for i in 1..=6 {
-                let at = t0 + Duration::from_millis(1500 * i);
-                assert!(!d.allows(Command::Reject, at), "repeat {i} got through");
-            }
-        }
-
-        /// Waiting it out is how a second removal is expressed on purpose.
-        #[test]
-        fn a_deliberate_repeat_after_the_window_runs() {
-            let mut d = Debounce::default();
-            let t0 = Instant::now();
-            assert!(d.allows(Command::Reject, t0));
-            assert!(d.allows(Command::Reject, t0 + Duration::from_millis(3100)));
-        }
-
-        /// Different commands never mask each other, in either order.
-        #[test]
-        fn an_unrelated_command_in_between_is_not_blocked() {
-            let mut d = Debounce::default();
-            let t0 = Instant::now();
-            let soon = t0 + Duration::from_millis(200);
-
-            assert!(d.allows(Command::Reject, t0));
-            assert!(d.allows(Command::Clear, soon), "a clear is not a reject");
-            assert!(
-                d.allows(Command::Reject, soon + Duration::from_millis(200)),
-                "and the clear displaced the reject rather than extending it"
-            );
-        }
-
-        /// Repeating "undo" is how a run of rejects is walked back out, so the
-        /// repetition there *is* the intention.
-        #[test]
-        fn harmless_and_intentionally_repeatable_commands_are_never_guarded() {
-            for command in [Command::Rollback, Command::Commit, Command::Copy] {
-                let mut d = Debounce::default();
-                let t0 = Instant::now();
-                assert!(d.allows(command, t0), "{command:?}");
-                assert!(d.allows(command, t0), "{command:?} must repeat freely");
-                assert!(d.allows(command, t0), "{command:?} must repeat freely");
-            }
-        }
-
-        /// An unguarded command must not leave a stale entry that a later
-        /// reject is then measured against.
-        #[test]
-        fn an_unguarded_command_clears_the_guard() {
-            let mut d = Debounce::default();
-            let t0 = Instant::now();
-
-            assert!(d.allows(Command::Reject, t0));
-            assert!(d.allows(Command::Commit, t0));
-            assert!(
-                d.allows(Command::Reject, t0),
-                "the commit ended the reject's window"
-            );
-        }
+    /// Two deletes in one breath remove two sentences. A repeat is read as
+    /// meaning it twice, with undo as the recourse.
+    #[test]
+    fn a_repeated_command_is_not_collapsed() {
+        assert_eq!(
+            split_str("Luna, delete. Luna, delete."),
+            vec![Segment::Run(Command::Delete), Segment::Run(Command::Delete)]
+        );
+        assert_eq!(
+            split_str("Luna, clear. Luna, clear."),
+            vec![Segment::Run(Command::Clear), Segment::Run(Command::Clear)]
+        );
     }
 
     #[test]
     fn every_verb_is_recognised() {
         for (spoken, want) in [
-            ("Luna, commit", Command::Commit),
-            ("Luna, reject", Command::Reject),
+            ("Luna, delete", Command::Delete),
+            ("Luna, discard", Command::Discard),
+            ("Luna, keep", Command::Keep),
             ("Luna, clear", Command::Clear),
             ("Luna, copy", Command::Copy),
             ("Luna, rollback", Command::Rollback),
@@ -477,17 +345,15 @@ mod tests {
         }
     }
 
-    /// Observed live: the model writes a spoken "Luna, reject" as
-    /// `Luna rejects.` The speaker said the verb, so the command has to fire —
-    /// and every verb takes the same treatment, since there is nothing special
-    /// about `reject` except that it is the one caught doing it.
+    /// The recogniser conjugates a spoken verb, so the `-s` form must fire.
+    /// Applies to every verb, not only the one first observed.
     #[test]
     fn a_conjugated_verb_is_the_same_command() {
         for (spoken, want) in [
-            ("Luna, commits", Command::Commit),
-            ("Luna rejects", Command::Reject),
+            ("Luna deletes", Command::Delete),
+            ("Luna, discards", Command::Discard),
+            ("Luna, keeps", Command::Keep),
             ("Luna, clears", Command::Clear),
-            // Both the spelling the model would choose and the one it might.
             ("Luna, copies", Command::Copy),
             ("Luna, copys", Command::Copy),
             ("Luna, rollbacks", Command::Rollback),
@@ -498,15 +364,15 @@ mod tests {
         }
     }
 
-    /// The allowance stops at `-s`. A past or progressive form is a plausible
-    /// thing to say about a person called Luna, and a false command deletes
-    /// text — so the line is drawn where the tense stops being one a speaker
-    /// giving an instruction would ever use.
+    /// The allowance stops at `-s`. Past and progressive forms are plausible
+    /// things to say about a person, and a false command deletes text.
     #[test]
     fn other_conjugations_are_still_dictation() {
         for line in [
-            "Luna committed",
-            "Luna rejecting",
+            "Luna deleted",
+            "Luna deleting",
+            "Luna discarded",
+            "Luna kept",
             "Luna cleared",
             "Luna copied",
             "Luna undone",
@@ -535,19 +401,18 @@ mod tests {
     fn the_hint_names_the_configured_wake_word() {
         assert_eq!(
             hint("Luna"),
-            "Commands: Luna commit, Luna reject, Luna clear, Luna copy, \
-             Luna undo, Luna rollback."
+            "Commands: Luna delete, Luna discard, Luna keep, Luna clear, \
+             Luna copy, Luna undo, Luna rollback."
         );
-        assert!(hint("Jarvis").starts_with("Commands: Jarvis commit,"));
+        assert!(hint("Jarvis").starts_with("Commands: Jarvis delete,"));
         assert!(!hint("Jarvis").contains("Luna"));
     }
 
     /// The wake word is configurable, so nothing may be hard-coded to "luna".
     #[test]
     fn the_wake_word_is_configurable() {
-        let w = words("Jarvis, commit");
-        assert_eq!(split(&w, "Jarvis"), vec![Segment::Run(Command::Commit)]);
-        // And the default no longer fires on it.
+        let w = words("Jarvis, copy");
+        assert_eq!(split(&w, "Jarvis"), vec![Segment::Run(Command::Copy)]);
         assert_eq!(split(&w, "Luna"), vec![Segment::Text(w.clone())]);
     }
 
@@ -556,19 +421,16 @@ mod tests {
     #[test]
     fn ordinary_speech_is_not_a_command() {
         for line in [
-            // The wake word alone, as a name.
             "Luna went to the store.",
-            // The verb alone, which is an ordinary English word.
-            "I will commit the change tomorrow.",
-            "The reviewers reject bad patches.",
-            // Right words, wrong order.
-            "Commit Luna",
-            // Something between them: nothing may come between the two.
-            "Luna please commit",
-            "Luna, I want you to commit",
-            // A verb that is merely similar.
-            "Luna committed",
-            "Luna rejecting",
+            "I will copy the change tomorrow.",
+            "The reviewers delete bad patches.",
+            "We should discard the first draft.",
+            "Please keep the receipt.",
+            "Copy Luna",
+            "Luna please copy",
+            "Luna, I want you to copy",
+            "Luna deleted",
+            "Luna deleting",
         ] {
             assert_eq!(
                 split_str(line),
@@ -594,7 +456,7 @@ mod tests {
     /// transcript would be read as the wake word.
     #[test]
     fn an_empty_wake_word_never_matches() {
-        let w = words(", commit and , reject");
+        let w = words(", copy and , delete");
         assert_eq!(split(&w, ""), vec![Segment::Text(w.clone())]);
         assert_eq!(split(&w, "..."), vec![Segment::Text(w)]);
     }
@@ -604,13 +466,19 @@ mod tests {
         assert!(split(&[], "Luna").is_empty());
     }
 
-    /// What `main.rs` uses to decide whether the audio may be retained for a
-    /// continuation. A retained command would fire a second time.
+    /// What `main.rs` uses twice: to decide whether the audio may be retained
+    /// for a continuation — a retained command would fire a second time — and
+    /// to decide whether the hinted re-decode has anything left to find.
     #[test]
     fn has_command_sees_what_split_sees() {
-        assert!(has_command(&words("Luna, commit"), "Luna"));
-        assert!(has_command(&words("Some text. Luna, reject"), "Luna"));
+        assert!(has_command(&words("Luna, copy"), "Luna"));
+        assert!(has_command(&words("Some text. Luna, delete"), "Luna"));
         assert!(!has_command(&words("Luna went home."), "Luna"));
         assert!(!has_command(&[], "Luna"));
+        assert!(!has_command(&words("Luna, commit"), "Luna"));
+
+        assert!(!has_command(&words("Luna, roll back."), "Luna"));
+        assert!(!has_command(&words("Lunar delete."), "Luna"));
+        assert!(!has_command(&words("Muna delete."), "Luna"));
     }
 }

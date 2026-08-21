@@ -18,6 +18,12 @@ the moment it happens rather than after the fact.
 This is a deliberate product stance: provisional text is a feature, not noise.
 It is the correctness signal the interaction is built on.
 
+**"Stabilizes" means *files*, not *agrees*.** Text used to go plain the moment
+LocalAgreement agreed it, mid-utterance, and that was withdrawn on report — see
+§6, *Where plain begins*. Everything in flight is dim; the transition the
+speaker reads is the one into the document, which happens once and never
+reverses.
+
 ---
 
 ## 2. Decisions
@@ -31,7 +37,7 @@ It is the correctness signal the interaction is built on.
 | D5 | **VAD for gating + segmentation** | Suppresses hallucination on silence; supplies utterance-final commit trigger |
 | D6 | Latency target: **≤2s to stable** | User-specified. Buys LocalAgreement n=3 |
 | D7 | Rust implements only the pipeline | Capture, VAD, buffering, transcript state machine, rendering |
-| D8 | **The transcript is a live document, not scrollback** | `reject` has to reach committed text, and scrollback is the one region a program cannot take back (§6) |
+| D8 | **The transcript is a live document, not scrollback** | `delete` has to reach a sentence filed minutes ago, and scrollback is the one region a program cannot take back (§6) |
 | D9 | **Trim at a pause, never mid-word** | An utterance is never truncated; what gets bounded is how far behind the transcript falls (§3) |
 | D10 | **Wake word for document operations only** | "keep this" / "throw that away" have no acoustic signal at all, unlike a self-repair (§6) |
 | D11 | **Autosave every change; delete only on a clean exit** | The paths that used to lose the transcript are exactly the ones that cannot run cleanup, so the file survives them for free (§6) |
@@ -150,10 +156,22 @@ Resulting commit latency at the default n=3 / 500ms: **~1.1–1.2s** for typical
 2–6s buffers, inside the 2s target at ≤43% duty. n=2 (~0.7s) is still
 affordable, and so is a shorter interval.
 
-**Duty cycle remains the constraint to watch**, since it scales with buffer
-length; `main.rs` warns when inference exceeds the tick interval, which is the
-point at which the system falls behind realtime permanently. Buffer trim policy
-is therefore load-bearing. Cut at committed sentence boundaries, preferably at
+**Duty cycle is no longer the constraint to watch, and saying so was hiding the
+one that is.** It scales with buffer length only until the tick stretch engages,
+and after that `tick = infer × 1.25` pins it at exactly 80% *by construction* —
+so the number cannot move, and a notice keyed on it fires whenever inference
+merely grows. Measured over a 109s session, the old "refresh slowed" condition
+was true for **48% of it**, on a pipeline that was keeping up throughout.
+
+What actually degrades is **commit latency**, `(n−1) × tick + inference`, which
+grows on both terms with the buffer, is what the speaker sees, and had nothing
+watching it: over that same session it exceeded D6's 2s target for **36% of the
+time**, peaking at 3.06s. `main.rs` now reports that instead, and phrases it as
+something the speaker can act on — pausing endpoints the utterance, which files
+it and starts the next one short.
+
+Buffer trim policy is therefore load-bearing, and load-bearing for latency
+rather than for duty. Cut at committed sentence boundaries, preferably at
 VAD-detected silence.
 
 ### The tick stretches; the window does not shrink
@@ -240,7 +258,8 @@ raises the bar rather than the candidate list:
 
 | buffer | eligible gaps |
 |---|---|
-| < `--trim-after-s` | *(no trim)* |
+| < ½ × `--trim-after-s` | *(no trim)* |
+| ≥ ½ × `--trim-after-s` | ≥ ~480ms — a sentence boundary, nothing less |
 | ≥ `--trim-after-s` | ≥ ~190ms — D9's quality bar, unchanged |
 | ≥ 2 × `--trim-after-s` | any recorded silence, longest still preferred |
 
@@ -252,12 +271,200 @@ longest-gap preference is untouched, so nothing changes for a speaker who pauses
 normally. Verified with `--trim-after-s 10` on 80s of continuous speech: the
 buffer peaked at **13.3s** against the 20s bound.
 
+### Trimming early at a good gap, rather than late at whatever is left
+
+The band at **½ × `--trim-after-s`** is new, and the argument for it is that
+waiting was buying nothing. Between 15s and 30s the old policy refused to cut at
+all, while a sentence-grade gap was available the entire time — measured over a
+109s session, **50% of 202 recorded gaps were ≥480ms, and every one of the 21
+snapshots taken had one**. So the buffer was being carried to 30s, and the
+latency paid for it, purely because nothing was looking yet.
+
+The bar in that band is *higher* than the one a late trim settles for, which is
+what makes it safe: it can only ever produce a cut better than the one that
+would otherwise have happened at 30s.
+
+Measured on the same 109s passage, everything else default:
+
+| | old | with the eager band |
+|---|---|---|
+| buffer, median / max | 13.7s / **30.0s** | 9.4s / **15.0s** |
+| commit latency, median / max | 1.61s / **3.03s** | 1.33s / **1.94s** |
+| time past D6's 2s target | **35%** | **0%** |
+| duty cycle | **81%** | **49%** |
+| trims | 3 | 7 |
+| transcript | — | byte-identical |
+
+**Duty went down while the trim count went up**, which is the result to hold on
+to: more trims are more forward passes, but every one of them is on a shorter
+buffer, and inference grows faster than linearly in buffer length. Trimming more
+often is *cheaper*, not dearer.
+
+### Longest gap still wins, and latest-wins was tried and measured worse
+
+Cutting at the longest gap looks wrong once the buffer is what you are trying to
+bound, because the **merge seam** wins that contest by construction — the
+reconstructed pause is capped at `MAX_GAP_SAMPLES` (1.2s), longer than
+`--endpoint-ms` permits any within-utterance gap to be — and it sits wherever
+the last merge happened. Measured, that took 9.8s off a 30.3s buffer and left
+20.5s standing; two of three trims in one session did the same.
+
+So latest-wins was tried, guarded by the ≥480ms floor, on the argument that once
+every candidate is sentence-grade, position is free to decide. **The argument
+was wrong.** Same audio, five rules:
+
+| rule | buffer max | commit max | seams |
+|---|---|---|---|
+| longest, ≥480ms | 15.0s | 1.94s | clean |
+| longest, ≥190ms | 15.0s | 1.93s | clean |
+| latest, ≥576ms | 14.9s | 1.85s | clean |
+| **latest, ≥480ms** | 14.8s | 1.81s | **`The measurement should come first,`** |
+
+That stranded entry is the exact signature recorded above for most-recent-wins.
+A 480ms floor does not separate a comma from a boundary as cleanly as the
+~200/~500ms rule of thumb implies — the speaker had left ~500ms after a comma.
+
+The decisive column is the first: **every rule bounds the buffer identically.**
+The eager band did all of it and the selection rule contributed nothing, so
+there was never anything to buy by reversing a measured decision. The ≥480ms
+floor is kept as insurance rather than tuning: with longest-wins selecting,
+dropping it to ~190ms produced a byte-identical transcript.
+
+### Where to cut was only half the question
+
+Every rule above decides *where* in the audio to cut. None of them asked whether
+the text either side of the cut had been settled, and that is what produced the
+failure reported live at the shipped defaults:
+
+```text
+It tries to solve the problem.
+Of coordination between participants, a single node can communicate with the other nodes.
+```
+
+One spoken sentence, one deliberate mid-sentence pause, two document entries.
+The capitalised `Of` is the tell — it is a fragment that was decoded **alone**
+and punctuated as though it stood by itself, which is §5's `say,` -> `Say,`
+finding happening at a seam the pipeline created.
+
+**The trim did it, and by construction rather than by bad luck.** The merge seam
+is the longest gap in the buffer *always*: `scan` stops at an endpoint, so no
+within-utterance gap can exceed `--endpoint-ms` (36 frames), while a seam
+carries the reconstructed pause (up to `MAX_GAP_SAMPLES`, 75 frames). So
+longest-wins selects it every time, and §5 arranges for every ordinary pause
+to merge — so this was the normal trim, not an edge case. The trim then decoded
+`window[..cut]` **alone** and filed whatever came back.
+
+Measured on the reported sentence, same audio, three decodes:
+
+| decoded | text |
+|---|---|
+| whole buffer | `It tries to solve the problem of coordination between participants. A single node can communicate with the other nodes.` |
+| head alone, cut at the pause | `It tries to solve the problem.` |
+| tail alone | `Of coordination between participants, a single node can communicate with the other nodes.` |
+
+The middle row is the reported first line and the bottom row is the reported
+second line, character for character. So the pipeline was asking the model
+exactly the right question — the whole buffer, merged, prosody intact — and then
+throwing that answer away in favour of the answer to a worse one.
+
+### The head decode is a question now, not a filing
+
+The trim still decodes `window[..cut]`, and still costs that forward pass, but
+what it does with the result is inverted:
+
+- the text is compared against the document (`Transcript::unfiled`);
+- **zero words unaccounted for** — every word of the head is already filed, from
+  a decode that had the whole buffer in front of it — the audio is spent, so it
+  is cut away and **nothing is filed**;
+- **anything else** — the cut would strand text that has never been filed, so
+  the trim gives up this tick and the buffer grows instead.
+
+Nothing about *where* changed. What changed is that the trim stopped being a
+filing path at all: on the ordinary path it now only ever discards audio whose
+text is already in the document, and logical commitment (§6) — which reads the
+whole-buffer decode — is what files.
+
+Reproduced end to end under `--simulate`, at the shipped defaults, on a passage
+with a 1.6s mid-sentence pause 17s in:
+
+| | transcript around the pause |
+|---|---|
+| before | `…and it tries to solve the problem.` / `Of coordination between participants, …` |
+| **after** | `…and it tries to solve the problem of coordination between participants.` |
+
+The trace records the moment: `trim-refused  cut at 17.50s would strand 60
+word(s)`.
+
+**The cost is latency, and it is not small.** On a 37s passage of ten sentences,
+same audio, everything else default:
+
+| | before | after |
+|---|---|---|
+| transcript | ground truth | ground truth — one numeral differs, `three` vs `3` |
+| trims taken | 3 | 2 |
+| trims refused (a forward pass each) | 0 | 9 |
+| commit latency past D6's 2s target | never | once, 2.0s at a 20s buffer |
+
+On the mid-pause repro the buffer ran to 27s where the old code cut at 17s, and
+commit latency peaked at 2.9s against 2.1s. That is the trade taken knowingly
+and it is the same one D9 states: **latency is recoverable and a filed fragment
+is not.** A refused trim costs seconds of lag that any pause gives back; the cut
+it refused costs a sentence that can never be repaired, because plain text never
+changes.
+
+Two things bound the cost:
+
+- A refusal is **remembered on the gap itself** (`Dip::refused`), keyed on
+  `Transcript::revision`, so the same cut is not re-probed every tick — only
+  when the document moves and the answer could have changed. Holding it beside
+  the buffer instead, and resetting it at each endpoint, cost 17 refusals where
+  9 would do, because §5 merges every ordinary pause and each merge restarted
+  the walk.
+- A refusal takes **everything after it** out of contention as well as the gap
+  probed, since a later cut severs the same sentence and more of it. So the trim
+  walks backwards through candidates, one pass per tick, and each pass is on a
+  shorter head than the last.
+
+### The backstop, and what it still costs
+
+Refusing is only bounded while something else eventually files the text.
+Logical commitment does, on ordinary dictation. It does **not** for a speaker
+producing one very long sentence, or one who keeps naming the assistant (which
+makes `commit_settled` decline), and there the refusal has no bound at all —
+which is the 63.6s buffer above, the one that took ~67s in a single forward pass
+and stopped responding for a minute.
+
+So past **2 × `--trim-after-s`** (60s at the defaults) the trim gives up and
+files the head decode, exactly as it used to. That is the same shape of argument
+as the desperate band and deliberately the same number: by then the pipeline has
+already stopped holding out for a good place to cut, and holding out for
+well-founded text on top of that would be insisting on quality in a situation
+that has run out of it.
+
+**This is the one path that can still produce the reported damage**, and it is
+traced as `trim-forced` for exactly that reason. Verified by making it fire, with
+`--trim-after-s 8` so the ceiling is 16s:
+
+```text
+So we should review the metrics before.
+The end of the week, because I think the.
+```
+
+That is the failure, reproduced on demand. At the default the same passage needs
+60s of continuously un-filed speech to reach it. Which speakers reach it is not
+known without real dictation: a speaker whose sentences run 20s each produces
+the three sentences commitment needs only after ~60s.
+
 ### Measured duty cycle, end to end
 
 On the 42s passage above, at `--trim-after-s 30` with everything else default:
 **63 passes, 29.8s of inference for 41.6s of audio — 72% duty**, of which only
 1.4s was off-tick. Wall time 44.7s against an ideal of 45.4s. So the pipeline
 sustains realtime with ~28% headroom at a 30s trim threshold.
+
+Re-measured on the 109s session above with the eager band in place: **49% duty**,
+wall time 112.1s against 109.2s of audio. The headroom roughly doubled, and the
+cause is entirely the shorter buffer.
 
 Protocol overhead is **~7ms per pass** — the whole buffer is re-sent as base64
 JSON every tick (66MB over that run) and it does not matter. Do not bother
@@ -274,7 +481,10 @@ was in fact keeping up at 72%. It now paces against an absolute deadline
 (`start + 20ms × n`). Never measure throughput with a relative-sleep pacer.
 
 Model load: **~1.0s** warm (~42s first run, including download), plus ~1.5–2s of
-warmup before the sidecar reports ready — so budget **~3s** of startup, not 1s.
+warmup before the sidecar reports ready. Warmup runs **twice** — once with the
+command hint and once without, because §7 now uses both prompt states and a
+command is the worst place to pay graph compilation. So budget **~4.5s** of
+startup, not 1s.
 
 **Utterance-final words** never receive right-context from later speech, so
 sliding-window alone leaves them provisional forever. VAD close (400–700ms
@@ -297,14 +507,14 @@ sliding-window covers the interior, VAD close covers the terminus.
 └───────────────────────────────┼─────────────────────────────┘
                                 ↓
 ┌────────────────── Python sidecar (MLX) ─────────────────────┐
-│  Qwen3-ASR-0.6B  →  hypothesis text                         │
+│  Qwen3-ASR-1.7B → hypothesis (no prompt; hint only on ask)  │
 └───────────────────────────────┬─────────────────────────────┘
                                 ↓ NDJSON / stdout
 ┌───────────────────────────────┼─────────────────────────────┐
 │  LocalAgreement-3 committer   ↓                             │
 │      └→ window state (agreed | provisional)                 │
-│          └→ command parse (wake word) ──→ commit / reject   │
-│              └→ document (sentences, each kept or pending)  │
+│          └→ command parse (wake word) ──→ delete / undo   │
+│              └→ document (finished sentences)               │
 │                  └→ alternate-screen live view              │
 │                      └→ real scrollback, once, on exit      │
 └─────────────────────────────────────────────────────────────┘
@@ -352,12 +562,26 @@ incompleteness, but *presence* proves nothing.
 
 This used to drive `looks_incomplete`, a trailing-function-word check that gave
 a cleanly-finished sentence only a quarter of the grace window. **That heuristic
-is gone**, and deliberately: the grace is now a flat `--continue-ms` for every
-utterance. It existed to limit pointless re-decoding when a settled sentence had
-already been printed to scrollback, and nothing is printed any more (§6) — a
-settling sentence just sits dim in the live document, so leaving it open costs
-nothing worth guessing about. Do not reintroduce it to save recompute; the
-measurement below says recompute was never the expensive part.
+is gone**, and deliberately: the hold is the same for every utterance, and only
+its *length* varies (see `Settle`, below). It existed to limit pointless
+re-decoding when a settled sentence had already been printed to scrollback, and
+nothing is printed any more (§6) — a settling sentence just sits dim in the live
+document, so leaving it open costs nothing worth guessing about. Do not
+reintroduce it to save recompute; the measurement below says recompute was never
+the expensive part.
+
+**And the measurement has since got much sharper.** The shredded passage below
+came back as six fragments, and **every one of them ended in a full stop** —
+`Okay, so let's speak about the politicians.`, `See.`, `To be doing very well.`
+So this is not a heuristic that is merely weak; on the exact input where a
+completeness test would have to work, it has no signal at all. Any future
+attempt to decide "has this thought finished?" from the text of one utterance
+should start by explaining what it does differently, because punctuation is
+settled: it cannot.
+
+`Settle` is not that heuristic returning by another door. It never reads the
+text; it measures the *speaker*, and it only ever adjusts how long to wait
+before filing — never whether the text looks ready.
 
 **The merge must carry the real pause.** Originally it did not, and that was a
 self-inflicted bug rather than a limit of the model. On endpoint the window ends
@@ -376,32 +600,177 @@ and splices it back on merge, capped at `MAX_GAP_SAMPLES` (1.2s — beyond about
 second the model already reads a boundary, so faithfully reproducing a 30s pause
 would only cost encoder time).
 
+### The seam length does not decide the boundary — measured, and it supersedes the table above
+
+The table immediately above says the model reads a ~1.4s silence as a sentence
+boundary and a ~0.9s one as a comma. **That does not reproduce under a
+controlled test, and the mechanism it implies is not there.**
+
+It matters because it was the leading candidate for the failure in §3. The seam
+the model actually receives is 892–2092ms — trailing silence inside the held
+audio (`close_frames`, 592ms) plus the spliced gap (0–1200ms) plus the retained
+pre-roll (≤300ms) — so on that reading an ordinary ~1.2s hesitation would land
+above the split threshold and be *instructed* to become two sentences. The fix
+would have been to normalise every seam to one fixed length, which the pipeline
+can do exactly, since it synthesises the silence itself.
+
+It was gated on a probe first. Identical speech either side, seam length the
+only variable, `Qwen3-ASR-1.7B-8bit`:
+
+| audio | 0 / 300 / 600 / 900 / 1400 / 2092 / 4000 ms of seam |
+|---|---|
+| `"It tries to solve the problem"` + `"of coordination between participants, …"`, spliced | **byte-identical at every length** — fused, one sentence |
+| the same passage from one continuous synthesis, its own pause shortened in post | **byte-identical at every length** |
+| `"This is the first complete sentence."` + `"And this is a totally separate one."` | **byte-identical** — a comma at every length, including 2092ms |
+| the same pair from one synthesis with `[[slnc 2000]]` | **byte-identical** — a comma at every length |
+| `"The deployment finished at noon."` + `"My cat is asleep on the keyboard."` | **byte-identical** — two sentences at every length, including 0ms |
+
+Five conditions, nine lengths, and the boundary never moved once. The third and
+fourth rows are the table above's own example, at 2.2s of silence, coming back
+with a comma.
+
+So the boundary is **prosodic and semantic, not durational**, which is the
+stronger form of what §5 already says: the model arbitrates, and it arbitrates
+on what it hears in the speech rather than on how long the gap is. That is
+consistent with the row above it — merging *unrelated* sentences still returns
+two sentences, at any seam length, including none at all.
+
+**What the original table probably measured** is the pipeline, not the model: it
+compared a file with a real pause against *the merge path*, which differs in
+more than silence length. Comparing two things that differ in two ways and
+attributing the difference to one of them is the error, and it is worth naming
+because the fix it justified — `gap_samples`, `MAX_GAP_SAMPLES` — is still in
+the code.
+
+**Nothing was changed on the strength of this.** The seam is still reconstructed
+exactly as described above. A null result licenses *not* making a change; it
+does not license making the opposite one, and normalising the seam would cost a
+re-measurement of §3's trim policy to buy an effect measured at zero. What it
+does license is disbelieving the mechanism: **a mid-sentence pause of any length
+is not what splits a sentence here, and anyone reaching for `MAX_GAP_SAMPLES` to
+fix a split boundary should read §3 first.**
+
+Caveat, stated because it is the whole weakness of the probe: this is
+synthesized speech, whose prosody is clean and unambiguous by construction. A
+real hesitation is precisely the ambiguous case where a weak durational cue
+could still tip a decision the model is otherwise unsure about. The probe rules
+out a strong dependence, not a marginal one. It needs re-running on a recorded
+human pause before the caveat can be dropped.
+
 **Consequence: generous `continue_ms` values are safe.** Verified against known
 ground truth at 0 / 2000 / 4000 / 8000 ms — continuations fuse, separate
 utterances stay separate, transcription accuracy unchanged. Raising it costs
 recompute and on-screen movement, not correctness.
 
-**Default is 6000ms.** This is one number doing two jobs that pull in opposite
-directions, which is why it is worth stating rather than tuning by feel:
+**It went 4000 → 10000 → 6000, and 6000 was wrong.** The number was tuned
+against how quickly text goes plain, on the reading that it was one number doing
+two jobs pulling in opposite directions:
 
 - it is how long text stays **dim** — shorter is more responsive;
 - it is how long a **thinking pause** may run before one thought becomes two
   sentences — longer is more forgiving.
 
-It went 4000 → 10000 → 6000. Ten seconds settled text so late the display felt
-unresponsive; six keeps the merge generous while halving the wait. Verified end
-to end from both sides at each setting:
+The second job is not one a duration can do, and it never was. That is now
+`Settle` in `main.rs`, and the default floor is **15000ms**.
 
-| gap | result |
+### The settle is a display parameter, and treating it as a linguistic one shredded a passage
+
+Reported live, and reproduced exactly. A speaker thinking out loud with ~7s
+pauses, dictating a passage that is two sentences:
+
+| | transcript |
 |---|---|
-| 4s (inside the window) | `This is the first thought, and this continues it.` — merged, one sentence, comma across the seam |
-| 8s (past it, would have merged at 10s) | `This is the first thought.` / `This is a separate thought.` |
-| 12s (past it) | two sentences, no merge |
+| filed on the 6s timer | `Okay, so let's speak about the politicians.` / `And politics, which I rather feel.` / `Is a little bit off the rails.` / `I wonder if this discrepancy.` / `Works well so far because it doesn't seem.` / `To be doing very well.` |
+| **audio held together** | `Okay, so let's speak about the politicians and politics, which I rather feel is a little bit off the rails.` / `I wonder if this discrepancy works well so far, because it doesn't seem to be doing very well.` |
 
-The cost is real but is not accuracy: **every** ordinary pause still falls inside
-6s, so a dictation session merges continuously and the buffer never resets on its
-own. That is precisely what makes the §3 trim load-bearing rather than a nicety
-— without it, a ten-minute session would be a single 600s window.
+The second is verbatim ground truth — right fusion, right separation into two,
+right commas.
+
+**Read the capitalisation in the first row.** `And`, `Is`, `Works`, `To` are each
+a fragment that was decoded *alone* and therefore punctuated as a whole
+sentence: this section's own `say,` → `Say,` finding, happening six times in one
+passage. So filing early does not merely put the sentence boundaries in the
+wrong place. It damages the words either side of every boundary, permanently,
+because plain text never changes.
+
+**The margin was 300ms.** A 7s speaking pause reaches the settle as a ~6.3s
+gap — `--endpoint-ms` is spent detecting the silence before the hold even
+starts — against a 6000ms window. The speaker was on the wrong side of a cliff
+by a rounding error, which is why the damage was total rather than occasional.
+
+### Why holding is the safe direction, and why it is nearly free
+
+The two ways to be wrong are not comparable:
+
+- **Hold too long** — text stays dim a few seconds more. The store already
+  writes in-flight text (§6), so a crash takes nothing either. Recoverable.
+- **File too early** — the passage is cut mid-thought and the surface forms
+  around the cut are wrong. **Not** recoverable.
+
+So the policy leans hard toward holding. What makes that affordable is that the
+timer is *unreachable on ordinary dictation* — every ordinary pause is already
+shorter than the floor, so it never fires at all. Measured over a normal-paced
+passage, settle as the only variable:
+
+| | 6s settle | 600s settle |
+|---|---|---|
+| transcript | — | **byte-identical** |
+| buffer max | 14.8s | 14.9s |
+| commit latency max | 1.70s | 1.66s |
+| forward passes | 33 | 33 |
+| inference total | 10.4s | 10.4s |
+
+Nothing moves, because nothing reaches the timer. Raising the floor changes
+behaviour only for the speaker it was damaging.
+
+The slow passage above does pay for it, and the bill is small: buffer max 2.9s →
+14.2s, inference 3.8s → 7.0s over 47s of audio, commit latency max 1.17s →
+1.37s — still inside D6's 2s target.
+
+### It adapts, because a fixed floor is not enough
+
+A larger fixed number is paid by everyone every time they stop for good. Worse,
+it does not actually solve the problem — it just moves the cliff. Measured on a
+passage with 20s pauses:
+
+| policy | entries |
+|---|---|
+| fixed 6s | 4 fragments |
+| **fixed 15s** | **4 fragments** — the cliff moved, nothing else |
+| 15s floor + adaptive | **2** |
+
+So `Settle` learns. It remembers the last five silences the speaker went on
+talking through and holds for the longest of them plus half again, clamped
+between `--continue-ms` and `--continue-max-ms` (default 60s). Traced on that
+same passage:
+
+```text
+16.843 EXPIRE   held=15.01s settle=15.00s     ← the first pause is lost
+16.843 FILE     "The first part of the sentence."
+21.021 RESUMED  gap=19.18s settle_now=28.77s  ← and pays for every one after it
+42.180 RESUMED  gap=19.41s settle_now=29.12s
+42.181 MERGE    held_audio=1.78s
+63.843 RESUMED  gap=19.29s settle_now=29.12s
+63.844 MERGE    held_audio=5.24s
+```
+
+**One fragment is still lost, and that is inherent**: a pause is only measurable
+once it ends, so the first one past the floor cannot be held. Everything after
+it is.
+
+**It learns from every resumption, including the ones it got wrong.** The gap is
+recorded whether or not the hold was still open when speech restarted. Learning
+only from *merged* pauses would mean never learning about a pause longer than
+the current settle — which is the only kind that has ever caused damage, and is
+precisely the blindness §7 records the deleted `mentions_wake` gate having.
+
+A zero floor (`--continue-ms 0`) switches adaptation off: it is an explicit
+instruction not to hold, and adapting past it would be overriding the speaker.
+
+**Consequence, unchanged and now load-bearing twice over:** every ordinary pause
+merges, so a dictation session merges continuously and the buffer never resets
+on its own. That is what makes the §3 trim load-bearing rather than a nicety —
+without it, a ten-minute session would be a single 600s window.
 
 ### Terminal safety: never write what you may have to take back
 
@@ -433,10 +802,13 @@ Consequences worth keeping:
 - `retract()`, `revisable` and `is_tty()` are gone.
 - Styling downgrades from partly-plain to fully-dim at the endpoint. That is
   correct, not a glitch: the instant an utterance becomes retractable, *every*
-  word in it is provisional again.
+  word in it is provisional again. **Superseded, and in the direction this
+  sentence points**: if the endpoint makes every word provisional again, the
+  words were provisional all along, so nothing in flight is plain any more and
+  there is no downgrade left to explain. See §6, *Where plain begins*.
 
 **This argument was later followed one step further.** If plain text must not
-appear while the *pipeline* can still rewrite it, then a `reject` command that
+appear while the *pipeline* can still rewrite it, then a `delete` command that
 lets the *speaker* rewrite it means the transcript cannot live in the scrollback
 at all — see §6. `Renderer::settling` and `Renderer::held` are gone with the
 rest; a settling sentence is now simply a dim entry in a document that is
@@ -467,8 +839,147 @@ The core of the product. Owns:
 
 The **window** is LocalAgreement as before: `committed` there is a claim about
 the *pipeline* — these words are agreed and nothing upstream will revise them.
-The **document** is a `Vec<Sentence>`, each carrying `committed: bool`, which is
-a claim about the *speaker* — they said "Luna, commit" out loud.
+The **document** is a `Vec<Sentence>`: what the speaker has finished saying.
+
+A `Sentence` used to carry a second `committed: bool` — a claim about the
+*speaker*, set by `Luna, commit`. That flag is gone; see *The approval flag, and
+why it was decay rather than design* below.
+
+### Logical commitment: a sentence files when other sentences follow it
+
+**What files a sentence is its position in the transcript, not the clock.**
+`Transcript::settled_prefix` keeps the last [`KEEP_SENTENCES`] (2) of the window
+and files everything before them; `main.rs::commit_settled` runs it after every
+tick.
+
+The rule is one sentence long: **a sentence is settled once enough further
+sentences exist behind it that the model has demonstrably stopped revising it.**
+
+It is deliberately *not* a completeness test on the sentence itself. §5 measured
+that the model punctuates whatever it is handed — the six fragments of the
+reported failure each ended in a full stop — so terminal punctuation says
+nothing about whether a thought has finished. What it marks reliably is where
+the model *chose* a boundary, and a boundary that survives more speech arriving
+behind it has had all the right-context it will ever get. §7 has the numbers:
+60 re-checks, 4 revisions, all four `3` ↔ `three`.
+
+Two consequences worth knowing before touching it:
+
+- **The audio stays.** Filing is a claim about text, not a reason to discard
+  anything, and `Transcript::filed` strips the re-decoded copy off every later
+  hypothesis. Cutting the audio is the trim's job and is measured to be
+  destructive when done early (§7) — these are different operations and the
+  distinction is the whole reason this works at all.
+- **It declines when the assistant is named.** A command must be parsed from a
+  finalized utterance and never from a hypothesis (below), and filing early
+  would put `Luna, delete` in the transcript as dictation, permanently, before
+  the endpoint ever read it as an instruction. `command::names` is the guard;
+  it is coarser than `has_command` because a command can straddle the boundary
+  between what is settled and what is not.
+
+Measured on a 37s passage of ten sentences, against filing by trim alone:
+
+| | trim only | with commitment |
+|---|---|---|
+| first sentence plain at | 17.6s | **14.9s** |
+| document grows | in batches of 2 | **one sentence at a time** |
+| recovered by `kill -9` at T+25s | 2 sentences | **4** |
+| transcript | ground truth | **byte-identical** |
+
+The last row is the one that matters: this buys cadence, not accuracy. The
+transcript was already correct.
+
+`KEEP_SENTENCES` is 2 rather than 1 on the measurement's own terms. One is
+enough for stability, and 1 was tested and produces ground truth on every
+passage here — but the model punctuating fragments means the last "sentence" in
+the window is usually the one still being spoken, so keeping 2 is what actually
+delivers the one *complete* sentence of right-context the measurement vouches
+for. It costs one sentence of dim time against an irreversible operation.
+
+#### Commitment is the only path that files mid-passage now
+
+The trim used to file as well, and **that filing was the reported failure in
+§3**: it decoded the severed head and put whatever came back into the document.
+It no longer files on the ordinary path at all. The paths that can reach the
+document are now:
+
+| path | what decoded the text it files |
+|---|---|
+| logical commitment | the whole buffer |
+| the settle expiring, or an endpoint with nothing to hold | the whole utterance |
+| a spoken command's dictation segments | the whole utterance |
+| end of stream | the whole buffer |
+| the trim, past `2 × --trim-after-s` only | **the severed head** — the backstop, §3 |
+
+Every row but the last files text produced with all the right-context there was.
+That is the property to preserve when adding a sixth.
+
+**Two consequences that are easy to miss.**
+
+A command can no longer be executed by a trim. It used to be possible: the trim
+ran `resolve` and `apply` over a head decode, which is not a finalized utterance
+however much it resembles one. Commands are now parsed at endpoints and at end
+of stream only — the rule §6 states — with the forced backstop the one
+exception, and it inherits that with the rest of the old behaviour.
+
+And §7's "the trim is the only thing that gets text out of process memory during
+a long passage" is now **false, and its safety argument has to be re-derived
+rather than assumed**. What carries the passage is logical commitment plus the
+in-flight line the store writes (§6, *The file holds the utterance in flight
+too*). Verified after the change: `kill -9` at T+20s of a continuously-merging
+passage still recovers everything spoken up to ~2s before the kill.
+
+#### Knowing which path filed a sentence
+
+Six paths reach the document and a transcript does not say which one produced a
+given line. That cost two wrong diagnoses of the §3 failure before it was
+traced, so `STT_TRACE=<file>` now records one line per filing, per trim
+decision, and per notice:
+
+```text
+14.615  logical    The deployment finished at noon, and everything looked stable.
+17.231  trim-refused  cut at 7.43s would strand 11 word(s)
+18.580  trim       cut at 3.12s, head already filed
+40.784  eos-held   The database migration is scheduled for Saturday morning.
+```
+
+It writes to a **file**, never to the terminal, and that is a correctness
+requirement rather than a preference: §7 records a redraw bug whose cause was a
+bare `eprintln!` while the live region was up. Unset, every call is an atomic
+load and a return.
+
+### The sentence a fragment cannot be
+
+`text::split_sentences` refuses a boundary when the text after it opens with a
+word that cannot begin an English sentence — `of`, `which`, `whom`, `whose`,
+`than` — unless it is an idiom (`Of course`, `Which is why`) or set off by a
+comma within two words (`Of course,`).
+
+This is **insurance, not the fix** for §3's failure, and the distinction is
+worth keeping straight: the two halves of that report came from two different
+forward passes, so they never met in one string for this to see. What it catches
+is the same damage arriving inside a single decode.
+
+**It is not `looks_incomplete` returning by another door**, which §5 forbids.
+That heuristic read the text *before* a boundary and guessed whether the speaker
+had finished a thought — a question about intent, which §5 measured the model
+gives no signal for. This reads the text *after* a boundary and asks whether the
+string can grammatically **be** a sentence. "Of coordination between
+participants" is not an unfinished thought that might yet be finished; it is a
+prepositional phrase, and no continuation makes it a sentence, because what it
+modifies is on the other side of the split. That is a property of the string,
+decidable from the string.
+
+The list is five words long, and what is missing from it is the argument.
+`to`, `for`, `with`, `from`, `by`, `in`, `on`, `at` all look like members and
+are not, because fronting an adverbial is ordinary English — "For now we wait.",
+"By Friday the release ships." `and` and `but` are missing for the stronger
+version of the same reason: they open spoken sentences constantly. A false
+positive merges two real sentences into one document entry, costing `delete`
+granularity and a sentence of filing delay; a false negative leaves a permanent
+fragment. Both costs are real, which is why the list is short rather than empty.
+
+### Filing is still the caller's decision at an endpoint
 
 `finalize_window()` deliberately does **not** file into the document. The caller
 decides, because an utterance that has merely ended may still be a hesitation
@@ -476,7 +987,7 @@ decides, because an utterance that has merely ended may still be a hesitation
 `retract_last_sentence()` is gone — a pending sentence is no longer in the
 document to retract.
 
-**Scrollback is the one region a program cannot take back.** `Luna, reject` has
+**Scrollback is the one region a program cannot take back.** `Luna, delete` has
 to reach a sentence the speaker already committed, so the transcript cannot be
 appended to the scrollback while the session runs. It lives on the **alternate
 screen**, redrawn from the model every frame, and is written to the real
@@ -488,9 +999,62 @@ why. It was always a promise about the *pipeline*:
 | rendering | meaning |
 |---|---|
 | dim | the pipeline may still rewrite this |
-| plain, `│` gutter | settled; only the speaker can change it now |
-| plain, no gutter | the speaker committed it |
+| plain | settled; only the speaker can change it now |
+| `│` gutter | the utterance in flight, as against the transcript |
 | `⋮` gutter, top row | more transcript above than the screen holds |
+
+The gutter is deliberately *not* on the same axis as the styling. It answers "is
+this the sentence being spoken right now?", and it is now the only thing
+distinguishing the agreed head of the live tail, which is dim like the rest of
+it.
+
+#### Where plain begins, and why it moved
+
+The boundary used to sit at **LocalAgreement**: the agreed head of the live tail
+rendered plain while the provisional remainder stayed dim. It now sits at the
+**document**. Everything in flight is dim; text goes plain when it files.
+
+Reported live as text appearing white and then turning grey again on the next
+breath. The sequence looks like a rendering fault and is not:
+
+1. speaking — LocalAgreement promotes the head, which renders plain;
+2. the speaker pauses — the utterance moves to `Pending` and renders wholly dim;
+3. they resume inside `--continue-ms` — the audio merges, `finalize_window` has
+   already emptied `committed`, and the re-decode starts from nothing.
+
+**The dim was never the wrong half.** Plain claims the pipeline is finished with
+a word, and inside an utterance that claim is false by construction: the §5
+merge re-decodes the *entire* buffer and can rewrite every word in it, which is
+precisely why the merge happens at the audio level rather than the text level.
+The promotion at step 1 was the lie; steps 2 and 3 were the pipeline telling the
+truth late.
+
+The cost is real and is not argued away: a word can no longer be watched
+stabilising inside an utterance. That signal was only ever trustworthy for an
+utterance that never merged, and §5 arranges for almost every ordinary pause to
+merge — so it was a promise kept sometimes, which is not a promise. Held
+absolutely it is worth more: text moves dim → plain exactly once, in one
+direction, and never back.
+
+**LocalAgreement is untouched as data.** This section's own first line draws
+that distinction — committed versus provisional is state, not styling — and only
+the styling was taken away. `committed` and `provisional` still arrive at the
+renderer as separate slices, and the state machine still depends on the
+difference.
+
+Consequence worth knowing before tuning anything: **filing is what promotes, so
+whatever files decides when text goes white.** The trim used to be the only
+thing that did mid-passage — §5 merges every ordinary pause, so an utterance
+never settles on its own — which made `--trim-after-s 30` show nothing plain for
+the first ~30s of continuous speech, and made trim cadence a display property as
+well as the latency control §3 treats it as.
+
+Logical commitment (above) is now the main one, and it promotes on sentence
+structure rather than on buffer length: measured on a 37s passage, the first
+sentence went plain at 14.9s instead of 17.6s and the document then grew one
+sentence at a time rather than two at a time. The trim still files whatever is
+left over when it cuts, so the coupling §7 records for persistence is unchanged
+— it is simply no longer the only path.
 
 The last of those is about the screen rather than the text, and it exists
 because its absence cost two wrong diagnoses. **The live tail is never capped**
@@ -501,7 +1065,7 @@ actually was. Nothing is hidden to make room for the marker: it replaces a
 gutter that was already budgeted, so it cannot widen a row (§7 records the last
 elision marker doing exactly that).
 
-A speaker rejecting their own sentence is not the pipeline changing its mind, so
+A speaker deleting their own sentence is not the pipeline changing its mind, so
 plain text still means what it always meant.
 
 Consequences:
@@ -525,29 +1089,164 @@ Consequences:
   where the loop is blocked in a long forward pass.
 - **`Renderer::drop` also restores**, so a panic cannot leave the terminal
   wedged either.
-- Uncommitted sentences are still printed at exit. Losing text because someone
-  forgot the magic words would be indefensible; the count goes to **stderr** so
-  it cannot pollute the transcript on stdout.
+- Every sentence is printed at exit, unconditionally. Losing text because someone
+  forgot a magic word would be indefensible — and since that was true from the
+  start, no magic word ever gated it, which is the argument below.
 - The document is also on disk throughout, which is what makes the destructive
   commands safe — see *The session file* below.
 
+### The approval flag, and why it was decay rather than design
+
+`Sentence.committed` is **removed**, along with `Luna, commit`, `commit_all`,
+the third rung of the styling ladder and the "N kept, M pending" status line.
+This is not a reversal of a measurement; it is the removal of something whose
+last load-bearing role had already been taken away and whose corpse nobody
+noticed.
+
+The tell was that by the end it had **four consumers and all four were
+display**: the gutter character, the status counter, an exit note on stderr, and
+the setter. Nothing branched on it. `copy` took the whole document, `finish()`
+printed the whole document, `delete` and `clear` ignored it.
+
+Four things make the reading "leftover" rather than "cosmetic but intentional":
+
+- **Its one real job was deleted on measured use.** `copy` used to take kept
+  sentences only. That was reversed above, on a live session reporting *0 kept,
+  4 pending*. Nothing gated on the flag after that.
+- **The session file cannot represent it.** `store::load` returned everything
+  `committed: true`, so `--resume` silently approved a transcript the speaker
+  had not approved. A state the product's own persistence format cannot store,
+  whose loss was never filed as a bug, is not load-bearing. The round trip is
+  now lossless by construction.
+- **Every way to give it teeth is already rejected here, on principle.** Gating
+  output — "losing text because someone forgot the magic words would be
+  indefensible". Auto-commit on the settle timer — rejected below. Protecting a
+  committed sentence from `delete` — the *inverse* of the requirement that
+  forced the document model into existence.
+- **The ladder argument does not survive re-reading.** The styling contract is
+  about **mutability**: dim = the pipeline may rewrite this, plain = it will
+  not. Commit changed no mutability whatsoever — a committed sentence was
+  exactly as deletable as a pending one. So the third rung was not extending
+  that contract, it was orthogonal decoration sitting on it. The `│` gutter now
+  carries a question that *is* answerable — in flight, or filed — which is what
+  it was always actually distinguishing.
+
+What it cost, meanwhile, was not nothing: a fifth verb in the model's vocabulary
+hint (§7), and `commit` was the most ordinary English word of the set — "I will
+commit the change tomorrow" — plus its `-s` surface, `Luna commits`. **A verb
+that moves no text is pure false-command risk**, since a false match can only
+ever destroy. That is the entry requirement now: every remaining verb changes
+the transcript.
+
+The one honest argument the other way is that "kept" marked how far the speaker
+had reviewed. There is nowhere to review *to*: the live view has no scrollback
+(§9), so an older sentence cannot be looked at, only deleted blind.
+
 ### Spoken commands
 
-`command.rs`. `Luna, commit` keeps everything settled so far; `Luna, reject`
-drops the newest sentence, **including one already committed**. The name is
-`--assistant`, default `Luna`.
+`command.rs`. `Luna, delete` drops the newest sentence; `Luna, undo` puts it
+back. The name is `--assistant`, default `Luna`.
+
+#### Two scopes, `delete` and `discard`
+
+They are not synonyms, and naming them as though they were — the verb was
+`reject` for a while, against `discard` — hid the one distinction they exist to
+draw. An utterance becomes **one document entry per sentence** via
+`split_sentences`, so "drop the last sentence" and "forget what I just said" are
+the same instruction only when the model heard one sentence in it.
+
+- `delete` is **document-scoped**: the newest entry, whatever it is and however
+  long ago it was filed.
+- `discard` is **utterance-scoped**: everything the current utterance filed.
+
+Measured end to end, same audio, verb the only difference — `"The deployment
+finished at noon."` / 3s / `"My cat is asleep on the keyboard."` / 1.2s / verb:
+
+| verb | result |
+|---|---|
+| `keep` | `keep — filed 2 sentence(s)`, both printed |
+| `discard` | `discard — dropped 2 sentence(s)`, document empty |
+| `delete` | would leave the deployment line standing |
+
+**`discard` reaches further than it used to, because an utterance is longer than
+it used to be.** The §5 settle now holds across a thinking pause, so two
+sentences separated by an 8s pause are *one* utterance where they were two.
+Measured, same audio, settle the only variable:
+
+| settle | result of `Luna, discard` |
+|---|---|
+| 6s (old) | `dropped 1 sentence(s)` — the earlier sentence survives |
+| 15s (current) | `dropped 2 sentence(s)` — both go |
+
+This is left as it is, and the reasoning is worth recording because §6 otherwise
+forbids exactly this. It is not the scope *widening to whatever is nearest* —
+which is what that rule bans, and what `delete` is for. It is the scope tracking
+its own definition: `discard` has always meant "everything this utterance
+filed", and the utterance really is bigger now. It is also announced — every
+branch reports its count through `notice` — and `undo` restores the group as one
+entry.
+
+What bounds it in practice is the trim: each `apply` counts only what *that*
+finalized utterance filed, so a discard cannot reach past the last trim.
+
+**The scope is supplied by the caller, and that is the safety argument.**
+`Transcript::discard_last` takes a count; `main.rs::apply` maintains it as the
+number of sentences *this* utterance has filed and not yet closed off. So a
+discard cannot walk backwards into the transcript however many times it is said
+— verified, three in a row leave a settled sentence untouched. Saying it with
+nothing in flight removes **nothing** rather than falling back on the newest
+sentence, because silently widening the scope of a destructive command to
+whatever happens to be nearest is precisely what this module refuses to do.
+
+Every branch of `apply` that moves text has to keep that count honest, and the
+failure otherwise is specific: without `delete` decrementing it,
+`"Sentence. Luna, delete. Luna, discard."` deletes the sentence and then
+discards a *second* one this utterance never filed. `clear` and `rollback` zero
+it; `copy` leaves it alone, because copying moves no text.
+
+#### `keep`, and the honest case against it
+
+`keep` files what the utterance said and ends the settle. **It moves no text of
+its own**, and that has to be stated plainly because it is the property that
+killed `commit`.
+
+The reason is the §5 merge. Speaking inside the grace window merges the pending
+audio into the command's utterance, and the command branch in `main.rs` files
+the text and drops the audio *without* creating a new `Pending`. So **every**
+command already ends the settle early — `copy`, `delete` and `clear` all do it.
+By the time `Keep` runs, the Text segment ahead of it has already filed the
+words.
+
+What is left for it is thin but real, and it is three things `commit` never had:
+
+- it is the only way to end the settle **without a side effect**;
+- it marks the thought finished, so the next utterance starts from a fresh short
+  buffer instead of merging into a growing one — a §3 latency win the speaker
+  can ask for, since no duration threshold can tell terminal from hesitation
+  silence and they are the only one who knows;
+- it closes the utterance off from a following `discard`.
+
+That is weaker than the other five verbs and should be re-read as a candidate
+for removal if it goes unused. The entry requirement was **every verb must move
+text**; this one moves text *in time* rather than in content, which is a
+weakening of the rule, admitted here rather than argued away.
 
 **This reverses the removal recorded below, and the two are not in conflict.**
 Self-repair replaced the wake word for *fixing a word*, and that was right —
 nobody says "admin" before stuttering, they just say the word again, and there
-is an acoustic signal to key off. But "keep this" and "throw that away" have no
-acoustic signal whatsoever. They are document operations, not speech events.
+is an acoustic signal to key off. But "throw that away" and "put it back" have
+no acoustic signal whatsoever. They are document operations, not speech events.
 Nothing short of a wake word can express them, which is exactly why one earns
 its place here and did not earn it there.
 
+**Every verb must move text**, which is the entry requirement `commit` failed.
+A verb that changes no text cannot help the speaker and can still fire by
+accident, so it is pure downside on both axes that matter here: the hint it adds
+to the model's context (§7) and the false-command surface below.
+
 **Detection runs on finalized utterances only, and this is a correctness
 requirement rather than an optimisation.** `repair()` is safe per-hypothesis
-because it is pure. Commands are not: `reject` destroys a sentence, and the
+because it is pure. Commands are not: `delete` destroys a sentence, and the
 sliding window re-decodes the same audio every 500ms, so per-hypothesis
 detection would empty the document one sentence per tick.
 
@@ -561,32 +1260,32 @@ Two rules together make a command fire exactly once:
    point.
 
 **Matching is wake word immediately followed by the verb**, compared through
-`normalize`, which is what makes "Luna, commit" and "Luna commit" the same input
+`normalize`, which is what makes "Luna, delete" and "Luna delete" the same input
 — the comma is punctuation the model chose and the parser never sees it. Nothing
 may come between them. The asymmetry justifies the strictness: a *missed*
 command costs one repetition, a *false* one deletes text the speaker meant to
 keep. Measured controls, all left as dictation: `Luna went to the store.`,
-`I will commit the change tomorrow.`, `Commit Luna`, `Luna please commit`,
-`Luna committed`.
+`I will copy the file tomorrow.`, `Copy Luna`, `Luna please copy`,
+`Luna deleted`.
 
 **A third-person `-s` on the verb is the same command**, and this is the one
-place the strictness is relaxed. Reported live: a spoken "Luna, reject" comes
-back from the model as `Luna rejects.` The speaker said the verb — the model
+place the strictness is relaxed. Reported live: a spoken "Luna, delete" comes
+back from the model as `Luna deletes.` The speaker said the verb — the model
 conjugated it — so reading that as dictation punishes them for a transcription
 they can neither see nor influence, and it is the one failure the wake word
 cannot rescue, because they *did* say the wake word. It applies to every verb,
-not just `reject`: `commits`, `clears`, `copies`, `rollbacks`, `undoes`.
+not just `delete`: `discards`, `keeps`, `clears`, `copies`, `rollbacks`, `undoes`.
 
-The cost is real and worth stating: `Luna rejects the offer.` is now a reject.
+The cost is real and worth stating: `Luna deletes the offer.` is now a delete.
 It is bounded rather than open-ended — `--assistant` retargets the name,
-`Debounce` stops a repeat compounding it, `rollback` takes it back — and the
-allowance stops at `-s`. `Luna committed` and `Luna rejecting` stay dictation,
-because a past or progressive form is a plausible thing to say *about* a person
-called Luna in a way the bare present tense following the name is not.
+`rollback` takes it back — and the allowance stops at `-s`. `Luna deleted` and
+`Luna deleting` stay dictation, because a past or progressive form is a
+plausible thing to say *about* a person called Luna in a way the bare present
+tense following the name is not.
 
 Segments are applied **in spoken order**, not with commands hoisted. "That's the
-wrong sentence. Luna, reject." must file the text before the reject reaches it,
-or the reject deletes the sentence before the one the speaker just finished.
+wrong sentence. Luna, delete." must file the text before the delete reaches it,
+or the delete removes the sentence before the one the speaker just finished.
 
 **The merge creates a seam comma that has to be closed.** Because a command
 usually follows a pause, §5 merges both halves into one buffer, and the model
@@ -596,14 +1295,17 @@ then punctuates them as running on. Measured end to end:
 |---|---|---|
 | "This is my first sentence." + "Luna, commit" | `This is my first sentence, Luna, commit.` | `This is my first sentence,` ← dangling |
 
+(Measured on the `commit` verb, which no longer exists. The seam is a property
+of the merge, not of which word followed the wake word, so it transfers.)
+
 `text::close_sentence` fixes the last word of a Text segment that is *terminated
 by a command*. This is not a guess about what the speaker meant: the words that
 followed were provably not part of the sentence, so the sentence ended there.
 Text appearing *after* a command is left alone — nothing establishes that it
 ended.
 
-Five verbs: `commit`, `reject`, `clear`, `copy`, and `rollback` — the last of
-which also answers to `undo`. Two words for one command is otherwise not
+Six verbs: `delete`, `discard`, `keep`, `clear`, `copy`, and `rollback` — the
+last of which also answers to `undo`. Two words for one command is otherwise not
 something this module does; `rollback` is the operation's name everywhere else
 here, `undo` is what people actually say, and both still require the wake word
 immediately before them so the extra surface costs nothing. Worth knowing that
@@ -612,81 +1314,89 @@ the model is not equally sure of them: measured, `Luna, undo` came back as
 The failure is benign — an unrecognised command is filed as dictation — and
 having the second verb is the recourse.
 
-`copy` takes the **whole document, and commits it** — copying is itself an act
-of approval, the same argument `--resume` makes about a recovered file.
+`copy` takes the **whole document**, with no approval filter in front of it.
 
 This reverses an earlier "committed sentences only" reading, on use. That
 reading was defensible in the abstract and useless in practice: reported from a
 live session as `copy` reporting *0 kept, 4 pending* after the speaker had
-waited out the settle window and assumed a settled sentence was a kept one. A
-speaker who says "copy" has looked at the text and decided to do something with
-it, which is what commitment records; making them say two commands to express
-one intention was ceremony, not safety.
+waited out the settle window and reasonably assumed settled text was theirs.
+Making them say two commands to express one intention was ceremony, not safety.
+The flag it filtered on has since gone entirely (§6), which retires the question.
 
 The boundary that **is** load-bearing survives untouched, and it is a different
 one: `copy` stops at the *document*. An utterance still inside its grace window
-is not in there yet, so text the **pipeline** may still rewrite is never copied
-and never committed. The rejected reading guarded against the speaker not having
-vouched for text; this one guards against the text not being final, which is the
-guarantee only this program can make. The commit lands only if `pbcopy`
-succeeded, since that is what the approval attaches to.
+is not in there yet, so text the **pipeline** may still rewrite is never copied.
+The rejected reading guarded against the speaker not having vouched for text;
+this one guards against the text not being final, which is the guarantee only
+this program can make.
 
 It shells out to `pbcopy` with both output streams silenced — a child writing to
 the terminal would land in the middle of a frame, the same invariant that made
 the sidecar's stderr a pipe rather than inherited.
 
-**Auto-committing on the settle timer was the alternative, and was rejected.**
-It would have collapsed the three-level ladder in §6: the `│` gutter would only
-ever flash for six seconds, `Luna, commit` would become a no-op, and "kept"
-would stop meaning the speaker approved anything — a timer would be doing the
-vouching. Copy-commits gets the same practical result at the moment the speaker
-actually acts.
+**Auto-committing on the settle timer was considered and rejected**, and it is
+worth recording that the *reason* given at the time was wrong in a way that
+pointed at the real answer. The argument was that a timer doing the vouching
+would collapse the three-level ladder and make `Luna, commit` a no-op. Both were
+true. What went unnoticed is that `commit` was *already* a no-op in every sense
+that reaches text — so the objection was really an argument for deleting the
+rung, not for defending it. That is what eventually happened.
 
-#### Repeats are suppressed on a timer, not per utterance
+#### Repeat suppression — removed, and what it turned on
 
-`Luna, reject` twice in quick succession is one intention said twice. The
-speaker cannot see a command land until the utterance ends, so a repeat inside
-roughly one reaction time means they think they were not heard — and taking it
-literally deletes a second sentence.
+There used to be a `command::Debounce`: a 3s wall-clock window that swallowed a
+second `Reject` or `Clear`. The argument was that the speaker cannot see a
+command land until the utterance ends, so a repeat inside roughly one reaction
+time is one intention said twice — and taking it literally deletes a second
+sentence.
 
-**The obvious implementation is wrong**, and measurably so. Collapsing adjacent
-commands inside `split` catches nothing in practice: 700ms between two "Luna,
-reject" is past `--endpoint-ms`, so they arrive as *two separate utterances* and
-`split` never sees them together. Measured, both fired and two sentences went.
+**It is gone, because the vocabulary hint removed the premise.** The guard was
+built for a speaker who repeats themselves *because they doubt they were heard*,
+and that doubt was well founded when `Luna, rollback` came back as
+`Luna, roll back.` and silently did nothing (§7). With the command list as
+`system_prompt` the commands are recognised on the first try, so a second
+`delete` is far better read as someone who means it twice — and the guard was
+costing them exactly that, with no recourse but waiting out a window they cannot
+see either.
 
-`command::Debounce` therefore works on wall-clock time, with a 3s window — sized
-from that measurement, where the two firings landed ~1.7s apart. It guards
-`Reject` and `Clear` only. **`Rollback` is deliberately unguarded**: saying
-"undo, undo, undo" is how a run of rejects is walked back out, so there the
-repetition *is* the intention. Each suppressed repeat re-stamps the window, so a
-burst of five collapses to one rather than letting every second one through.
+The asymmetry that justified it has flipped with it. It used to weigh *a false
+extra delete* against *one repetition*; it now weighs *a swallowed command*
+against *one `undo`*. `rollback` was always the reason a command as blunt as
+`clear` is safe to offer, and it was never guarded — "undo, undo, undo" is how a
+run of deletes is walked back out. That recourse covers the removal too.
 
-A suppressed command still reports itself. Silence is indistinguishable from not
-being heard, which is exactly what provokes the repeat.
+Two findings from it are worth keeping, because they cost measurements:
+
+- **Collapsing adjacent commands inside `split` would not have worked anyway.**
+  700ms between two "Luna, delete" is past `--endpoint-ms`, so they arrive as
+  *two separate utterances* and `split` never sees them together. Measured, both
+  fired and two sentences went — which is the behaviour the code is back to, and
+  the reason the guard had to be wall-clock rather than syntactic.
+- **Every command still reports itself through `notice`.** Silence is
+  indistinguishable from not being heard, which is exactly what provokes a
+  repeat. That was true when a suppressed command had to announce itself, and
+  the notice is now the whole acknowledgement.
 
 #### Rollback, and why `clear` is safe to have
 
 `clear` throws away the whole document, which is only defensible because
-`rollback` puts it back. Undo entries are **deltas, not snapshots**: a reject
+`rollback` puts it back. Undo entries are **deltas, not snapshots**: a delete
 remembers one sentence, where snapshotting would cost a copy of an
 unbounded transcript per step. Depth 64.
 
-Only text-*removing* commands are recorded. Undoing a `commit` would mean taking
-back an approval, which removes nothing and is not what anyone means by undo —
-and, more importantly, must not consume the undo entry that does have text
-behind it.
+Only text-*removing* commands are recorded, which since the removal of `commit`
+is every command except `copy`. Undoing a copy would remove nothing and would
+consume the entry that does have text behind it.
 
-Verified end to end on synthesized speech: commit keeps, reject drops a
-committed sentence and leaves the document empty, `clear` removes 2 and
-`rollback` restores both with their commit state intact, `copy` moves the kept
-text onto the real clipboard, a repeated reject is suppressed with a notice,
-`--assistant Jarvis` retargets everything, and `Luna went to the store.`
-survives as dictation.
+Verified end to end on synthesized speech: delete drops a sentence and leaves
+the document empty, `clear` removes 2 and `rollback` restores both, `copy` moves
+the text onto the real clipboard, `--assistant Jarvis` retargets everything, and
+`Luna went to the store.` survives as dictation.
 
 ### The session file
 
 `store.rs`. The document is written to `~/.local/state/speech-to-text-cli/` on
-every change, and **that is what makes `clear` and `reject` safe to offer**.
+every change, and **that is what makes `clear` and `delete` safe to offer**.
 
 Before this the transcript reached stdout once, at exit, and three paths skipped
 that write entirely: a second Ctrl-C (`libc::_exit`, which by design runs no
@@ -716,13 +1426,20 @@ what the speaker has said", and the gap between them was the whole passage.
 Reported from a live session as `Luna, copy` copying nothing and the session file
 being empty of everything just dictated.
 
-Mid-passage the **buffer trim is the only thing that files anything**. §5 merges
-every ordinary pause, so an utterance never settles, `finalize_window` files
-nothing by design, and the grace never closes. Between trims the text exists
-only in `Pending` and `Transcript::committed` — process memory, which is exactly
-what this module was written to stop relying on. The document, `copy` and the
-file all read `script.document()`, so one empty document explains all three
-reported symptoms at once.
+Mid-passage the **buffer trim was the only thing that filed anything**. §5
+merges every ordinary pause, so an utterance never settles, `finalize_window`
+files nothing by design, and the grace never closes. Between trims the text
+existed only in `Pending` and `Transcript::committed` — process memory, which is
+exactly what this module was written to stop relying on. The document, `copy`
+and the file all read `script.document()`, so one empty document explained all
+three reported symptoms at once.
+
+Logical commitment (§6) has since made the document fill steadily rather than
+only at a trim, which shortens the exposure — measured, a `kill -9` at T+25s of
+a 37s passage recovered 4 settled sentences where it used to recover 2. **It
+does not remove the need for any of what follows.** The last two sentences are
+always unfiled by construction, and a speaker who has said only one has nothing
+committed at all, so the in-flight text still has to reach the file.
 
 `Store::save` therefore takes the in-flight text as well, and writes it as
 trailing lines. Measured on a 41 s continuously-merging passage:
@@ -759,13 +1476,15 @@ specific file.
 
 Three decisions worth keeping:
 
-**Recovered text comes back kept.** The file stores text, not the workflow state
-that produced it, and there is nowhere to put that state without making the file
-something other than a clean transcript — which it has to stay, because
-`--persist` hands it to a human. Restoring as *pending* was the alternative and
-is worse: `Luna, copy` would come back empty on a resumed session, which is the
-opposite of picking up where you left off. Choosing to resume a transcript is
-itself an approval of it.
+**The round trip is lossless, and it took removing a field to make it so.** The
+file stores text, and a `Sentence` is now only its words, so what goes in is what
+comes back. It used to store text while a `Sentence` also carried an approval
+flag, which the format had nowhere to put: `load` therefore returned everything
+`committed: true` and a resumed session silently approved itself. That was
+rationalised at the time — "choosing to resume a transcript is itself an approval
+of it" — and the rationalisation was the tell. A field the persistence format
+cannot represent, whose loss has to be argued away rather than fixed, is not
+carrying weight. §6 records what came of noticing that.
 
 **A recovered session is continued in place, but only if it is ours.** A file
 found by us in our own state directory is adopted — same file, no duplicate, and
@@ -777,6 +1496,26 @@ explicit `--resume ~/mynotes.txt` left the file byte-identical.
 **`restore` is not undoable.** `rollback` takes back what the speaker did during
 a session, and this happened before the session began. Letting undo reach it
 would mean one "Luna, undo" emptying a transcript they had only just recovered.
+
+**A resumed session is deleted on a clean exit, and that is sharper than it
+sounds.** `--persist` governs an adopted file exactly as it governs a fresh one,
+so bare `--resume` without `--persist` **removes the file it just recovered**.
+The rationale is the same one as for a fresh session — stdout has the transcript
+by then — and it is consistent, but the two cases are not equally forgiving: a
+file reached by `--resume` exists *because something already went wrong*, and
+bare `--resume` picks it by mtime, so it can adopt and then delete a file the
+speaker never named. Observed for real during this work, on a file holding a
+live session's only copy. Left as designed, because the argument for it holds
+and `--persist` is the escape hatch — but if it is ever changed, this is why.
+
+**A failed `--resume` used to leave an empty file behind, and it poisoned the
+flag that would have found the real one (fixed).** `Store::new` writes its file
+up front, and the resume target was loaded *after* that — so a mistyped path
+exited non-zero having created `session-<now>.txt`, empty. Since
+`newest_session()` goes by mtime, that empty file was then the newest, so the
+next bare `--resume` adopted it, recovered nothing, and deleted it on the way
+out. One typo could put the real transcript permanently out of reach of the
+recovery flag. The load now happens **before** anything creates a session file.
 
 Two things the tests caught that are worth not re-learning:
 
@@ -807,7 +1546,7 @@ so repair needs no command; "throw that away" is not, so it needs nothing else.
 
 The cost of dropping the wake word *for repair* is real and is stated under
 *What this cannot do* below: an arbitrary substitution like "Tuesday…
-Wednesday" is still not expressible. `Luna, reject` does not recover it either
+Wednesday" is still not expressible. `Luna, delete` does not recover it either
 — it operates on whole sentences, not words.
 
 **The model transcribes disfluencies verbatim**, which is what makes the
@@ -1104,6 +1843,129 @@ sentence recorded without the stutter.
   biasing recognition of arbitrary vocabulary, it is fixing how the model
   *segments* two known words.
 
+- **The command hint does bias, just not the way the transcript did — so it is
+  off on the windows the speaker dictates into** *(the gating rule below is
+  superseded by the entry after it; the measurements are unchanged and are why
+  the hint is still absent from every live window)* — raised as "the model must
+  never hallucinate a command on keystrokes or background noise; it is biased
+  toward them because the system prompt names them." Half right, and the half
+  that is right was not visible in the table above, because that table only
+  asked whether the hint *echoes*.
+
+  It does not echo. What it does is **pull ambiguous audio toward the wake
+  word**. Measured on `Qwen3-ASR-1.7B-8bit`, same audio, prompt the only
+  difference:
+
+  | spoken | no prompt | with the hint |
+  |---|---|---|
+  | "Moon a" | `Muna.` | **`Luna.`** |
+  | "Luna respect" | `Lunar respect.` | **`Luna respect.`** |
+  | "Luna coffee" | `Luna Coffee.` | `Luna coffee.` |
+
+  Three cases, all in the same direction. Nothing here is a false *command* —
+  across eight deliberate near-misses (`Luna respect / here / coffee / project /
+  clearly / undertow`, "Moon a wreck") **the hint never invented a verb**. But it
+  makes the wake-word half of a trigger reachable from audio that contains no
+  wake word, on exactly the windows where nobody addressed the assistant.
+
+  Everything else came back empty with *and* without it: digital silence, white
+  noise at −45 dBFS, room tone at −38, 60 Hz hum, isolated keystrokes and
+  sustained typing. **Noise was never the problem.** Near-miss speech is.
+
+  **The fix is to stop paying for the hint on windows that cannot benefit from
+  it.** Measured across every verb and two voices, the unprompted decode already
+  handles four of the five:
+
+  | spoken | no prompt | with the hint |
+  |---|---|---|
+  | `Luna, delete` / `clear` / `copy` / `undo` | parses | parses |
+  | `Luna, rollback` | `Luna, roll back.` — **missed** | `Luna rollback.` |
+
+  One row disagrees, and in it the wake word is already recognised. So:
+  **decode unprompted; if the result names the assistant but carries no verb,
+  re-decode that same buffer with the hint and take commands from it.**
+  `main.rs::resolve`, gated on `command::mentions_wake`.
+
+  - Ordinary dictation, noise, keystrokes and near-misses never see the hint,
+    so its one measured bias has nothing to act on.
+  - `rollback` still works, which is the only thing the hint ever bought.
+  - The hinted reading replaces the unprompted one **only if it found a
+    command**, so text the speaker keeps is never prompt-influenced.
+
+  Verified end to end. A merged `That was wrong. Luna, rollback.` — which comes
+  back unprompted as `That was wrong, Luna. Roll back.` — triggered **exactly one
+  hinted pass out of 16** and the undo landed. A 30-pass run over dictation, the
+  `Moon a` near-miss, sustained typing, room tone and `The reviewers rejected
+  it.` triggered **zero**, and the near-miss stayed `Muna` instead of being
+  pulled to `Luna`.
+
+- **The gate above is removed: the hint now runs on every finalized utterance
+  that did not already parse as a command.** The design it replaces is the one
+  immediately above, and the reason is not new evidence — it is that the gate
+  assumed away the failure it existed to fix.
+
+  `mentions_wake` asked, of the **unprompted** transcript, "was the assistant
+  named?" That is a question about whether the model wrote the wake word
+  correctly. The two rows the entry above is built on are the model writing it
+  *incorrectly*: `Moon a` -> `Muna.`, `Luna respect` -> `Lunar respect.` So a
+  speaker who says "Luna, delete" and is transcribed `Lunar delete.` fails the
+  gate, never gets the hinted pass, and has their instruction filed as dictation
+  with nothing on screen to say so. The wake word cannot rescue them, because
+  they *did* say it — which §6 already identifies as the one failure mode with
+  no recourse, and the gate guaranteed it.
+
+  A fuzzier gate (edit distance, prefix containment, joined token pairs) only
+  moves the boundary and adds a second thing to be wrong about. So there is no
+  gate.
+
+  **Why that is safe is a different question from why it is affordable, and the
+  safety half is structural.** The acceptance test is unchanged: the hinted
+  reading replaces the unprompted one *only if it parses as a command*. `Muna.`
+  pulled to `Luna.` is discarded, because a bare wake word with no verb is not a
+  command. Every word the speaker keeps still comes from the unprompted pass.
+  Loosening the gate changed only the decision to **spend a forward pass**, and
+  that decision cannot damage text — which is the point the original entry
+  missed by holding a cheap decision to the bar of a destructive one.
+
+  Verified end to end with the hint now reaching every one of these:
+
+  | spoken | result |
+  |---|---|
+  | `The lunar module landed safely.` | unchanged — **not** pulled to `Luna` |
+  | `I will copy the file tomorrow.` | dictation |
+  | `We should discard the first draft.` | dictation |
+  | `Please keep the receipt for me.` | dictation |
+  | `Luna went to the store.` | dictation |
+  | `…will be dropped. Luna, delete. Luna, rollback.` | both fire, sentence restored |
+
+  The `lunar` row is the one to keep: it is the near-miss the old gate rejected,
+  it now gets the hint every time, and it still comes back `lunar`.
+
+  **Cost, stated rather than buried: one extra forward pass per endpoint**, paid
+  on the utterances that carry no command, which is most of them. It lands where
+  the loop is already off-tick, so `CAPTURE_BACKLOG` absorbs it and §3's warning
+  about back-to-back off-tick passes applies directly — this makes that worse,
+  not better. If it proves too expensive the fix is to hint a **bounded tail** of
+  the buffer rather than to put the gate back; a command is a few words at the
+  end of an utterance, so a 3–4s tail is ~150ms against ~1s for a 30s buffer.
+  Not implemented, because it needs a seam between the unprompted head and the
+  hinted tail and the cost has not yet been shown to matter.
+
+  **The structural invariant is strengthened, not weakened.** The per-request
+  field is a **boolean**, not a string: the host chooses whether the fixed prompt
+  applies, never what it says. There is still no text field, so the transcript
+  still cannot reach the model by any path — which is the property the original
+  ban was protecting, and the reason "pass it once at spawn" was only ever a
+  means to it.
+
+  Cost: one extra forward pass on an utterance that names the assistant without
+  commanding it, and a second warmup at startup so the rare hinted pass does not
+  pay graph compilation while the speaker waits. Startup is ~4.4s against ~3s.
+
+  **What this does not fix**, and is a different mechanism: `Luna copies the
+  file.` is still a `copy`, prompt or no prompt. That is the `-s` allowance in
+  §6, whose cost is stated there, and it is unaffected either way.
+
 - **Repetition loops** — decoder gets stuck. The compression-ratio heuristic
   (output that gzips too well is looping) plus temperature fallback is still
   unimplemented and still worth having. What *is* implemented is the token
@@ -1243,7 +2105,7 @@ sentence recorded without the stutter.
   rewrite it.** Dim is the only honest rendering of text that may change.
 
   Superseded by the stronger form in §6: nothing reaches the scrollback *at
-  all* until the session ends, because `Luna, reject` means the speaker can
+  all* until the session ends, because `Luna, delete` means the speaker can
   rewrite text the pipeline is finished with.
 
 - **A benchmark harness that was itself the bottleneck (fixed)** — the pipeline
@@ -1259,6 +2121,56 @@ sentence recorded without the stutter.
   pacer.** Any timing number produced before this fix should be re-measured
   before being trusted, and the failure is silent — it reads as "the system
   under test is slow", which is exactly what you were looking for.
+
+- **A whole utterance dropped when a pause was shorter than a forward pass
+  (fixed)** — the worst failure this program has had: **84 words, 30.5s of
+  speech, gone silently.** Found by instrumenting a 109s session rather than
+  reported, which is the only reason it was found at all — nothing on screen and
+  nothing in the session file said anything had been lost.
+
+  It is a direct consequence of the entry below. The loop drains the whole
+  capture backlog per iteration, so **one iteration covers as much audio as the
+  last forward pass took** — ~870ms at a 30s buffer, ~2s at 60s. That is longer
+  than `--endpoint-ms`, so a single batch of VAD frames can contain an utterance
+  ending *and* the next one beginning. Traced:
+
+  ```text
+  30.973s ONSET     {"pending": false, "win": 30.48}
+  30.973s ENDPOINT  {"buf": 30.48}
+  34.952s OVERWRITE {"lost_words": 84, "lost_audio": 30.48, "age_ms": 2226}
+  ```
+
+  Three independent things then had to go wrong, and they went wrong on their
+  own:
+
+  1. **The onset was observed before the `Pending` existed.** `main.rs` checks
+     the continuation merge *above* the endpoint handler that creates it, so the
+     onset merged nothing and was discarded.
+  2. **The VAD was left active.** That same onset re-opened it after the
+     endpoint closed it, so it emitted only `Speaking` afterwards and **no
+     second `Onset` ever came**. The merge is edge-triggered, so the held
+     utterance was not merely late — it was unreachable.
+  3. **`pending = Some(…)` was a bare assignment.** The next endpoint wrote over
+     the held utterance and its text went with it, 2.2s into its own 6s grace.
+
+  The fix is at the source: `scan()` **stops at an endpoint** and leaves the
+  remaining frames in the buffer, so the two events land in separate iterations
+  with the caller's `Pending` built in between. The window is split at the
+  endpoint rather than taken whole, so the next utterance keeps its own opening
+  audio instead of having it spliced onto the end of the last one. And the
+  assignment files any held utterance first — unreachable now, but this is the
+  one place where being wrong costs a whole utterance, so it does not rely on
+  the argument.
+
+  **It scaled with the buffer, which is what made it dangerous rather than
+  merely rare.** The longer the buffer, the wider the window in which a
+  resumption can be swallowed, *and* the more speech is riding on the `Pending`
+  that gets overwritten. The §3 trim work independently shortened the buffer,
+  which shrinks the exposure — but the ordering is the fix and the buffer length
+  was only ever the amplifier.
+
+  Verified end to end: the same session went from 12 transcript entries to 18,
+  with the passage's first eight sentences restored, and zero overwrite events.
 
 - **One chunk per loop iteration (fixed)** — the tick stretch keeps the steady
   state under 100% duty, but the endpoint pass, the merge re-decode and the trim
@@ -1310,10 +2222,18 @@ sentence recorded without the stutter.
 
   **The lesson worth keeping is the coupling, not the bug.** The trim was
   documented as a latency control — "what is bounded is how far behind the
-  transcript falls". It is also the *only* thing that gets text out of process
-  memory during a long passage, so starving it silently disabled the crash
-  safety net. Anything that changes trim policy has to be read as changing
-  persistence policy too.
+  transcript falls". It was also, at the time, the *only* thing that got text
+  out of process memory during a long passage, so starving it silently disabled
+  the crash safety net. Anything that changes trim policy has to be read as
+  changing persistence policy too.
+
+  **Superseded on the specifics, and the coupling is the reason to say so.** The
+  trim files nothing on the ordinary path any more (§3): logical commitment and
+  the in-flight line carry the passage instead. So the *lesson* holds exactly —
+  changing trim policy changed persistence again, and had to be re-verified —
+  while the sentence it was written about is no longer true. Re-verified after
+  the change with `kill -9` at T+20s of a continuously merging passage: the
+  session file held everything up to ~2s before the kill.
 
   Diagnosis note, because it cost two wrong answers: the first reading was
   "renderer starves the document" (`build_rows` draws the whole live tail before
@@ -1323,23 +2243,162 @@ sentence recorded without the stutter.
   merges, run it under `--simulate --persist`, and poll the session file. Do
   that first.
 
+- **One spoken sentence filed as two entries, because the trim decoded severed
+  audio (fixed)** — reported live at the shipped defaults, from a deliberate
+  mid-sentence pause:
+
+  ```text
+  It tries to solve the problem.
+  Of coordination between participants, a single node can communicate with the other nodes.
+  ```
+
+  Not a model failure. Handed the merged buffer the model returns the sentence
+  whole; the pipeline asked it that question, then filed the answer to a
+  different one — the head decoded alone, without the rest of the sentence in
+  front of it. §3 has the three-way decode and the fix. Two things are worth
+  repeating here because they generalise:
+
+  **A decode of severed audio is not evidence about a sentence boundary.** The
+  model punctuates whatever it is handed (§5), so a head that ends mid-sentence
+  comes back with a full stop on it and a tail that starts mid-sentence comes
+  back capitalised. Both are confident, both are wrong, and neither is
+  detectable from the text alone — which is why the test is "is this text
+  already in the document?" rather than anything about how the text looks.
+
+  **The seam-length reading was the obvious explanation and it was wrong.** The
+  merge splices up to 1.2s of silence and the total seam reaches ~2.1s, which
+  looks exactly like a boundary cue. Measured across five audio conditions and
+  seams from 0 to 4000ms, the boundary never moved (§5). Checking the mechanism
+  before building on it is what kept a flag out of the CLI that would have done
+  nothing.
+
+- **Cutting audio early damages the transcript; filing *text* early does not.
+  The two are not the same operation (measured — do not re-litigate)** — this
+  distinction cost a wrong conclusion before it was drawn, so it is worth
+  stating before either measurement.
+
+  **Cutting audio** removes context from every *future* decode. **Filing text**
+  removes nothing: the audio stays in the buffer and the model keeps re-decoding
+  all of it. Only the first is destructive, and conflating them made the second
+  look impossible.
+
+  Cutting early, on a 47s passage of 7s thinking pauses, audio held together so
+  the trim threshold is the only variable:
+
+  | `--trim-after-s` | trims | transcript |
+  |---|---|---|
+  | 30 | 1 | two sentences, verbatim ground truth |
+  | 20 | 2 | `…which I rather feel` / `Is a little bit off the rails.` — **stranded, no terminal punctuation** |
+  | 12 | 5 | six fragments — *identical to the broken baseline* |
+  | 8 | 5 | six fragments |
+
+  At `--trim-after-s 20` this is §9's "the trim seam is still a seam" caught in
+  the act. **The distinction that matters is *where* the cut lands, not how
+  early it is**: the `30` row also filed early — it cut at 11.18s, long before
+  the passage ended — and was perfect, because that cut fell on a true sentence
+  boundary.
+
+  Filing text early is a different question, and the answer is the opposite.
+  Logging every hypothesis the pipeline actually saw across three passages and
+  every merge in them, then asking whether a sentence ever changed once another
+  sentence had appeared behind it:
+
+  | | |
+  |---|---|
+  | non-final sentences re-checked | **60** |
+  | revisions | **4** |
+  | of those, `3` ↔ `three` | **4** |
+
+  No boundary moved, no word changed, no capitalisation changed. That is what
+  `Transcript::settled_prefix` rests on, and it is why commitment is a count of
+  sentences rather than a duration.
+
+- **Logical commitment is delicate in three specific ways, and all three were
+  found the hard way** — `settled_prefix` files a sentence while its audio is
+  still in the buffer, so the same words come back on every later decode. Each
+  of these produced visible transcript damage before it was fixed.
+
+  1. **The filed-text memory cannot be a word count.** A count indexes into one
+     decode, and the two that matter are of different audio — the trim decodes
+     `window[..cut]`, every tick decodes the whole buffer. `Transcript::filed`
+     matches on *content* instead.
+
+  2. **The overlap test has to tolerate a substitution.** Exact matching
+     collapses to zero on the one instability re-decoding is measured to have.
+     Observed:
+
+     ```text
+     13.01  logical  There was a spike around 3 in the afternoon.
+     13.55  trim     I think the latency numbers … around three in the afternoon.
+     ```
+
+     One word came back re-tokenised, no suffix matched, and two whole sentences
+     were filed a second time. The budget is proportional and floors at zero, so
+     short runs must still match exactly — this is *confirming a match known to
+     be there*, not searching for a coincidental one.
+
+  3. **Everything filed must be remembered, not just what commitment filed.**
+     The trim files through `push_sentence`, and its head decode can transcribe
+     a whole sentence from the part of it that was in the head — leaving the
+     rest of that sentence in the retained tail to be decoded again. Recording
+     only logical commits left the trim's own output unprotected, which filed
+     `The database migration is scheduled for Saturday morning.` twice.
+
+     Still true, and now load-bearing in the other direction: the same
+     filed-text memory is what the trim *asks* before cutting (§3), so the
+     substitution budget in point 2 is now deciding whether audio gets
+     discarded, not only whether text gets duplicated. A budget too tight
+     refuses good cuts and grows the buffer; too loose discards audio holding
+     text nobody has filed.
+
+  And one that is not about the overlap at all: **filing mid-window has to clear
+  the agreement deque.** The retained hypotheses were stripped against a shorter
+  `filed` than the next one will be, so their words no longer start at the same
+  place and `common_prefix_len` compares misaligned sequences. It produced
+  spliced nonsense — `We will migration is scheduled for Saturday morning.` —
+  and the invariant to hold onto is that **every hypothesis in the deque was
+  stripped against the same `filed`.** The cost is `agreement_n` ticks before
+  the next word is agreed, paid only when a sentence files.
+
+  All four only appear once commitment is eager enough to fire mid-passage,
+  which is the entire point of the mechanism. They are hazards of the design,
+  not of a setting: they were surfaced by lowering `KEEP_SENTENCES` to 1 and
+  they are latent at any value.
+
 ---
 
 ## 8. Layout
 
 ```
 src/main.rs        orchestration: window scheduling, tick loop, trim, commands
+                   `Settle` — how long an utterance is held (§5), adaptive
+                   the trim's endorsement test and `Dip::refused` (§3)
 src/audio.rs       cpal capture, downmix, resample to 16kHz; --simulate path
 src/vad.rs         earshot VAD + RMS floor, open/close hysteresis, dip runs
 src/transcript.rs  LocalAgreement-n window + the sentence document
+                   logical commitment (§6) + the filed-text overlap test
 src/repair.rs      self-repair detection ("regularing… regular")
-src/command.rs     wake-word commands + repeat debounce
+src/command.rs     wake-word command parsing
 src/store.rs       session autosave + clipboard
-src/text.rs        shared word/sentence helpers
+src/text.rs        shared word/sentence helpers + the implausible-opener veto
+src/trace.rs       filing-path trace, off unless `STT_TRACE` names a file
 src/render.rs      alternate-screen live document, wrap-safe row layout
 src/sidecar.rs     subprocess handle + NDJSON protocol
 sidecar/asr_sidecar.py   MLX inference; stdout is protocol, stderr is logs
+                         prompt is off unless the request asks for it (§7)
+                         — asked for once per finalized utterance, never on a
+                         window the speaker is dictating into
 ```
+
+Reproducing a filing-path question — which of the six paths in §6 put this
+line in the document? — starts with `STT_TRACE`:
+
+```sh
+STT_TRACE=/tmp/s.trace ./target/release/speech-to-text-cli --simulate f.wav
+```
+
+Never add an `eprintln!` for this instead. §7 records the redraw bug that comes
+straight back if anything writes to the terminal behind the renderer.
 
 Testing terminal output: pipe through a pty with
 `script -q out.raw ./target/release/speech-to-text-cli --simulate f.wav`, then
@@ -1355,12 +2414,15 @@ the gutter/dim ladder matches the state you expect.
 Synthesizing test speech, which is how the command and trim cases were verified:
 
 ```sh
-say -v Samantha -o t.aiff "A sentence. [[slnc 1500]] Luna, commit."
+say -v Samantha -o t.aiff "A sentence. [[slnc 1500]] Luna, delete."
 afconvert -f WAVE -d LEI16@16000 -c 1 t.aiff t.wav
 ```
 
 `[[slnc <ms>]]` inserts a real pause, which is what exercises the endpoint, the
-merge and the settle boundary. Note that `say` will not reliably produce a
+merge and the settle boundary. Note that a 1.4s gap is **not** enough to make
+the model file two sentences from one merged utterance — measured, it commas the
+seam instead. Two topically unrelated sentences and a 3s gap does it, which is
+what the `delete`/`discard` scope difference has to be verified against. Note that `say` will not reliably produce a
 *disfluency*: "regularing regular" comes back as `regular-irregular`, one
 hyphenated token, so `repair.rs` cannot be exercised this way.
 
@@ -1386,58 +2448,163 @@ byte-identical to the same sentence recorded without it, and six control
 sentences that merely resemble repairs are untouched.
 
 **Live document, spoken commands and the pause-aligned trim all work**, verified
-end to end on synthesized speech at the current defaults (99 unit tests green):
+end to end on synthesized speech at the current defaults (147 unit tests green).
+
+**Read the audio column with the caveat attached.** Everything below is
+synthesized speech, which has clean prosody and no genuine hesitation — so it is
+evidence about *mechanism* (does this code path fire, does this cut land, does
+this string split) and not about the thing the §3 failure is made of. The
+mid-sentence-pause rows reproduce the reported bug mechanically and show it gone;
+they do not establish that a human hesitating mid-thought now comes out whole.
+That needs real dictation, and so does sizing the backstop below.
 
 | case | result |
 |---|---|
-| `"First sentence. Luna, commit."` | filed and marked kept; seam comma closed to a full stop |
-| `"…should disappear. Luna, reject."` | dropped; document empty |
-| `"First sentence. Luna, commit. Luna, reject."` | **a committed sentence is dropped** — the requirement that forced the document model |
-| `"Luna, clear."` then `"Luna, rollback."` | 2 removed, 2 restored with commit state intact |
-| `"Luna, copy."` | the whole document lands on the real system clipboard, and is marked kept |
-| `"Luna, rejects."` | fires — and `--assistant Jarvis` on the same audio shows the model really did write `Luna rejects.` |
-| `"Luna, reject."` twice, 1.7s apart | second suppressed with a notice; one sentence dropped |
+| `"First sentence. Luna, copy."` | filed; seam comma closed to a full stop |
+| `"…should disappear. Luna, delete."` | dropped; document empty |
+| `"First sentence. Luna, copy. Luna, delete."` | **a sentence already copied is dropped** — the requirement that forced the document model |
+| `"Luna, clear."` then `"Luna, rollback."` | 2 removed, 2 restored |
+| `"Luna, copy."` | the whole document lands on the real system clipboard |
+| `"Luna, deletes."` | fires — and `--assistant Jarvis` on the same audio shows the model really did write the conjugated form |
+| `"Luna, delete."` twice, 1.7s apart | both fire; two sentences dropped, each announced — the debounce that used to collapse them is gone (§6) |
 | 20s of synthesized typing over room tone | nothing transcribed, at `--open-ms` 48 and 150 alike |
 | `--assistant Jarvis` | retargets every command and the banner |
 | `"Luna went to the store."` | left as dictation |
 | 4s gap | merged, one sentence, comma across the seam |
-| 8s / 12s gap | two sentences, no merge |
+| 8s / 12s gap | merged at the 15s floor, and the model **still returns two sentences** — over-merging is arbitrated, not damaging |
+| **47s passage, 7s thinking pauses** | **6 fragments → 2 sentences, verbatim ground truth** — the reported bug; `And politics` / `Is a little bit` / `To be doing very well` were fragments decoded alone |
+| same passage, normal-paced control | byte-identical at a 6s and a 600s settle: same buffer max, same commit latency, same 33 passes |
+| 66s passage, 20s pauses | fixed 6s and fixed 15s both give 4 fragments; adaptive gives **2** — the first pause is still lost, every later one is held |
+| 33s passage, 14s pauses | 2 sentences (was 3 fragments, one with a spurious `?`) |
+| same 47s passage, `--trim-after-s` 30 / 20 / 12 / 8 | 2 sentences / a stranded `Is a little bit off the rails.` / 6 fragments / 6 fragments — filing early damages text whatever triggers it |
+| `Luna, delete` after an 8s pause | fires — the command merges with the held utterance and still parses |
+| **37s passage, 10 sentences, logical commitment** | ground truth, and the document grows **one sentence at a time from 14.9s** where filing by trim alone grew two at a time from 17.6s |
+| same, `kill -9` at T+25s | **4 settled sentences recovered**, against 2 before |
+| same, `KEEP_SENTENCES` 1 vs 2 | both ground truth *after* the three overlap bugs in §7; 1 was what exposed all of them |
+| `Luna, delete` after 4 committed sentences | fires, drops the newest — and the wake word is never filed as dictation by a hypothesis |
+| live view through a pty, 37s passage | **175 in-flight rows all dim, 229 document rows all plain**, widest 79 at width 80 |
+| `Luna, discard` across an 8s pause | `dropped 2 sentence(s)` where the 6s settle dropped 1 — the scope tracks the longer utterance, announced and undoable (§6) |
+| `kill -9` at T+30s of the slow passage | the **fused** first sentence recovered from the session file, plus the partial second |
 | 42s unbroken passage | trimmed at pauses, 7 clean sentences, no word cut, 72% duty |
 | `kill -9` mid-session, no `--persist` | settled text recovered from the session file |
 | `kill -9` at T+20s of a continuously merging passage, before any trim | 4 sentences recovered, split one per line, with stdout empty as designed |
 | 41s passage, 1s pauses throughout (every gap merges) | file tracks the passage from T+6s; before the fix it held nothing until the first trim at ~T+33s |
 | 80s of continuous speech, `--trim-after-s 10` | buffer peaked at 13.3s against the 20s bound; transcript clean |
 | 63.6s buffer, token budget vs the 8192 default | byte-identical text, 1.82s vs 1.81s — the cap never binds on real speech |
-| `"…will be dropped. Luna, reject. Luna, rollback."` | both fire; the sentence is dropped and restored — `rollback` was unreachable before the vocabulary hint |
+| `"…will be dropped. Luna, delete. Luna, rollback."` | both fire; the sentence is dropped and restored — `rollback` was unreachable before the vocabulary hint |
 | command list as `system_prompt`, 20s noise / 41s dictation / controls | no echo, byte-identical, no false command |
+| hint always on vs off: `"Moon a"`, `"Luna respect"` | `Muna.` / `Lunar respect.` unprompted — the hint pulled both toward the wake word, which is why no live window ever sees it (§7) |
+| merged `"That was wrong. Luna, rollback."` | 1 hinted pass of 16; undo landed — the retry path doing its one job |
+| dictation + near-miss + typing + room tone + `"The reviewers rejected it."` | **0 hinted passes of 30**, under the gate that has since been removed; near-miss stayed `Muna` |
+| **`delete` vs `discard`**: 2 sentences in one breath, verb the only difference | `keep` filed 2 and printed both; `discard` dropped 2 and left the document empty — the scope difference `delete` alone cannot express |
+| `"Luna, discard."` x3 with one settled sentence | removes nothing; a discard cannot reach past the current utterance |
+| `"…thought. Luna, discard."` then `"Luna, undo."` | dropped and restored as **one** undo entry |
+| hint on **every** finalized utterance: `"The lunar module landed safely."` | unchanged — the near-miss the old gate rejected now gets the hint every time and still comes back `lunar`, not `Luna` |
+| same, `"I will copy the file tomorrow."` / `"We should discard the first draft."` / `"Please keep the receipt for me."` | all dictation; no false command from a hinted pass |
 | next launch after that kill | announces the orphaned session, naming it and its size |
 | `--resume` | recovers it, continues dictating, **adopts the file in place** — still one file |
 | `--resume ~/mynotes.txt` | loads it, leaves it byte-identical, opens a new session file |
 | `--resume` with nothing to resume | fails in 0.09s, exit 1, before the model loads |
+| `--resume <bad path>` | fails, exit 1, and now leaves **no** empty session file behind to poison the next bare `--resume` |
+| plain run / `--trim-after-s` / `--persist`, with another session's file present | that file is untouched — only bare `--resume` adopts, and therefore only it can delete one |
+| 109s dictation, endpoint and onset in one VAD batch | **84 words / 30.5s recovered** — 12 transcript entries became 18; the overwrite that dropped them cannot happen now |
+| same session, eager trim band | buffer max 30.0s → **15.0s**, commit latency max 3.03s → **1.94s**, duty 81% → **49%**, transcript byte-identical |
+| same session, five gap-selection rules | only latest-wins-at-480ms damaged a seam; every rule bounded the buffer identically, so longest-wins was kept |
+| live view through a pty, 40s clip | **211 in-flight rows all dim, 386 document rows all plain** — nothing renders plain while the pipeline can still rewrite it |
+| widest emitted row at width 80 | 79 columns — the strict-width invariant holds with the new styling |
+| live view through a pty, 47s slow passage | **258 in-flight rows all dim, 88 document rows all plain**, widest row 79 at width 80 — the settle change does not touch the styling contract |
+| **mid-sentence pause, 1.6s, 17s into a passage** | before: `…it tries to solve the problem.` / `Of coordination between participants, …` — the reported bug. After: **one sentence, whole** |
+| same audio, seam length swept 0 → 4000 ms (5 conditions, 9 lengths) | **the boundary never moved once** — the seam-length explanation is measured dead (§5) |
+| head / tail / whole-buffer decode of that passage | `It tries to solve the problem.` / `Of coordination between participants, …` / the sentence whole — the failure, isolated to the severed decode |
+| 37s passage, 10 sentences, endorsement test on vs off | same transcript bar one numeral (`three` vs `3`); 3 trims → 2 taken and 9 refused; commit latency past 2s once, at 2.0s |
+| the mid-pause repro, endorsement test on vs off | buffer 17s → 27s, commit latency 2.1s → 2.9s — the latency this trade costs, stated |
+| `--trim-after-s 8` on the same passage (ceiling 16s) | `So we should review the metrics before.` / `The end of the week, because I think the.` — the backstop reproducing the old damage on demand |
+| `kill -9` at T+20s, trim no longer filing | the passage still recovered from the session file, to within ~2s of the kill |
+| `split_sentences` opener veto | the reported fragment stays joined; `And` / `But` / `To be fair` / `For now` / `By Friday` / `In fact` / `Of course` / `Which is why` all still split |
 
 Not yet done:
+- **The audio is still cut by position — but a cut that lands mid-sentence no
+  longer files anything.** The trim asks the document before cutting (§3), so
+  the fragment it used to leave is gone from the ordinary path. The cut itself
+  is still chosen by pause length and still lands wherever it lands; what
+  changed is that a bad position now costs a refusal and some buffer instead of
+  a sentence. Locating the boundary *in the audio* remains impossible here:
+  punctuation cannot do it (the model punctuates fragments), timestamps need a
+  second model, and — measured, §5 — pause length carries no boundary signal at
+  all.
+- **The forced backstop can still file a fragment, and nobody knows how often.**
+  Past `2 × --trim-after-s` the trim files the severed head, because an
+  unbounded buffer is not an outcome (§3). Reproduced on demand at
+  `--trim-after-s 8`. At the default it needs 60s of speech that logical
+  commitment has not filed — which needs three sentences, so a speaker of very
+  long sentences reaches it far sooner than one of short ones. **This is the
+  residual risk of the whole change and it needs real dictation to size.** The
+  candidate fix is to file from the *whole-buffer* decode there rather than the
+  head, keeping only the incomplete tail in the window; it was not built because
+  a provisional word whose audio sits before the cut could be lost, and that
+  cannot be measured on synthesized speech either.
+- **Refusing a trim costs a forward pass, and a passage of long sentences pays
+  it repeatedly.** Measured at 9 refusals over a 37s passage. The memo on
+  `Dip::refused` bounds the repeats to one per candidate per document change,
+  and the refusals are cheaper than the passes they replace on the accepted
+  path (`resolve` no longer runs there) — but a speaker who never lets the
+  document move pays a pass per candidate per tick-batch, on a growing buffer.
+- **The `3` ↔ `three` instability now decides whether audio is discarded.** The
+  trim's endorsement test runs through the same overlap budget that dedupes
+  filed text (§7), so a decode that re-tokenises a word past the budget refuses
+  a cut it should have taken. It fails safe — the buffer grows rather than text
+  being lost — but the budget is now doing two jobs and was sized for one.
+- **The first pause past the settle floor is always lost.** A pause can only be
+  measured once it has ended, so a speaker whose habit exceeds `--continue-ms`
+  pays one fragment before `Settle` adapts. Nothing short of predicting the
+  pause fixes it; raising the floor only moves which speaker pays.
+- **`Settle` learns from silence, not from meaning.** A speaker who stops for a
+  minute mid-topic and one who stops for a minute because they have finished are
+  indistinguishable to it, so a long interruption stretches the hold for the
+  next few utterances. Bounded by `--continue-max-ms` and forgotten after five
+  pauses, but it is a real source of "why is my text still dim".
 - **Arbitrary substitutions.** "Tuesday… Wednesday" cannot be detected — the
-  words share nothing orthographically. `Luna, reject` does not recover it:
+  words share nothing orthographically. `Luna, delete` does not recover it:
   it operates on sentences, not words. See §6 *What this cannot do*.
 - **Cross-utterance repair.** A repair only reaches words in the current
   window. After a pause the §5 merge usually puts them back in it, but once the
   grace closes the false start is out of reach.
-- Repetition-loop detection (compression-ratio heuristic). Now more relevant
-  than it was: buffers routinely reach 30s, which is where long-generation
-  failures live.
+- Repetition-loop detection (compression-ratio heuristic). Less pressing than it
+  was — the eager trim band (§3) brought the measured buffer maximum from 30.0s
+  to 15.0s, so the long-generation regime is entered far less often — but the
+  token budget still bounds the damage without detecting the loop.
 - **No scrollback in the live view.** The document can grow past the screen and
   older sentences scroll out of sight. They are still in the document, still
-  rejectable and still printed at exit — but there is no way to look at them.
+  deletable and still printed at exit — but there is no way to look at them.
 - **The trim seam is still a seam.** Cutting at the longest pause makes it land
   at a sentence boundary most of the time, but "most of the time" is not always,
-  and nothing re-punctuates across it the way the §5 merge does.
-- **Undo does not reach a `commit`.** Only text removal is recorded, so there is
-  no way to un-keep a sentence short of rejecting and re-dictating it.
+  and nothing re-punctuates across it the way the §5 merge does. The eager band
+  (§3) made trims roughly twice as frequent without costing a seam on the
+  measured passage — but that is one passage, and the failure mode it would show
+  up as is a stranded half-sentence, which is exactly what latest-wins produced
+  when it was tried. Worth re-checking against real dictation before trusting
+  the frequency further.
+- **Duty cycle no longer has a warning at all.** The notice now reports commit
+  latency (§3), which is the right quantity for the speaker — but it means
+  nothing watches the case where inference genuinely exceeds realtime and the
+  capture channel backs up. The tick stretch makes that self-correcting in
+  steady state, and `CAPTURE_BACKLOG` absorbs the bursts, so this is a gap in
+  reporting rather than in behaviour.
+- **Undo does not reach a `keep`.** Only text removal is recorded, and `keep`
+  removes nothing — so there is no way to reopen a settle the speaker ended
+  early. The recourse is `delete` and re-dictating.
+- **Every finished thought costs a second forward pass**, since the hinted
+  re-decode is no longer gated (§7). Measured cost is one pass on a buffer that
+  was just decoded, at the moment the loop is already off its tick. The bounded
+  tail described in §7 is the fix if it starts to matter; it is not built.
+- **`keep` is the weakest verb here and is a removal candidate.** It moves no
+  text of its own — the merge files the utterance before the verb runs — so it
+  bends the "every verb must move text" rule to "moves text in time". §6 has
+  the full argument both ways.
 - **Session files accumulate under `--persist`.** Nothing prunes the state
   directory, and `--resume` only ever offers the newest one — an older orphan is
   reachable by path but is never mentioned.
-- **Resume restores text, not session state.** Commit marks, the undo stack and
-  the audio are all gone, so a resumed session cannot undo what the previous one
-  did.
+- **Resume restores text, not session state.** The undo stack and the audio are
+  gone, so a resumed session cannot undo what the previous one did.
 - **`copy` is macOS-only** (`pbcopy`), which matches D2 but would need replacing
   if the pipeline ever left Apple Silicon.

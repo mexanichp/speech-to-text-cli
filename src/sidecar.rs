@@ -1,8 +1,19 @@
-//! Handle to the Python/MLX inference process.
+//! Handle to the Python/MLX inference subprocess.
 //!
-//! Rust owns the pipeline; this process owns only the forward pass. They speak
-//! newline-delimited JSON over stdio — no socket, no port, and the sidecar dies
-//! with its parent.
+//! Rust owns the pipeline; the subprocess owns only the forward pass. They
+//! communicate in newline-delimited JSON over stdio, so the sidecar needs no
+//! socket and terminates with its parent.
+//!
+//! # Protocol
+//!
+//! Each request carries an id, base64 f32 PCM at 16 kHz, and a flag selecting
+//! whether the fixed vocabulary hint applies. Each reply echoes the request id.
+//!
+//! # Invariants
+//!
+//! The request has no free-text field. The host selects whether the prompt
+//! given at [`Sidecar::spawn`] applies, and can never supply prompt text, so no
+//! code path allows transcript content to reach the model.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
@@ -13,10 +24,11 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
+/// One decoded line of the sidecar's stdout stream.
 #[derive(Deserialize)]
 struct Envelope {
-    /// Echoed back from the request. `None` on a message the sidecar could not
-    /// attribute to one — a startup banner, or a request it failed to parse.
+    /// Request id echoed back, or `None` for an unattributable message such as
+    /// the startup banner or a request that failed to parse.
     #[serde(default)]
     id: Option<i64>,
     #[serde(default)]
@@ -31,27 +43,32 @@ struct Envelope {
     load_ms: Option<u64>,
 }
 
+/// A successful transcription of one audio window.
 pub struct Hypothesis {
+    /// Transcribed text, already trimmed by the sidecar.
     pub text: String,
+    /// Wall-clock cost of the forward pass, in milliseconds.
     pub infer_ms: u64,
 }
 
-/// What came back for one window.
+/// Outcome of transcribing one window.
 ///
-/// The distinction is between "this window failed" and "the sidecar is gone".
-/// Only the second is fatal: the model can fail on a single buffer and be
-/// perfectly healthy for the next one, and ending a dictation session over that
-/// would throw away the transcript the user is in the middle of speaking.
+/// Distinct from the `Err` case of the transcribe methods: this enum reports
+/// that the sidecar is alive and answered, whereas `Err` reports that the
+/// transport is gone and the session cannot continue. A model that refuses one
+/// buffer is usually healthy for the next, so refusal must not end the session.
 pub enum Reply {
+    /// The window was transcribed.
     Hypothesis(Hypothesis),
     /// The sidecar rejected this window and is still running.
     Failed(String),
 }
 
+/// Owning handle to a running sidecar process.
 pub struct Sidecar {
     child: Child,
-    /// `Option` so `Drop` can close it and let the sidecar exit on EOF rather
-    /// than being killed mid-flight.
+    /// Optional so [`Drop`] can close it, letting the sidecar exit on EOF
+    /// rather than being killed mid-request.
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     notices: Receiver<String>,
@@ -60,9 +77,18 @@ pub struct Sidecar {
 
 impl Sidecar {
     /// Spawns the sidecar and blocks until the model is resident and warm.
-    /// `prompt` is a fixed vocabulary hint, set **once here** and never per
-    /// request. See `command::hint` for why that distinction is the whole
-    /// safety argument, and §7 for the measurement it overturns.
+    ///
+    /// # Parameters
+    ///
+    /// - `prompt`: fixed vocabulary hint, passed once as a command-line
+    ///   argument. Individual requests may select it but may not replace it.
+    ///   An empty string omits it entirely.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the process cannot be spawned, or if its first message is not
+    /// the readiness banner. The sidecar's captured stderr is included in the
+    /// error, since it usually explains the cause.
     pub fn spawn(
         python: &Path,
         script: &Path,
@@ -82,8 +108,6 @@ impl Sidecar {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // Piped, not inherited: the sidecar must not write to the terminal
-            // directly, or it corrupts the renderer's row tracking.
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning sidecar: {} {}", python.display(), script.display()))?;
@@ -109,15 +133,12 @@ impl Sidecar {
             next_id: 0,
         };
 
-        // No live region exists yet, so startup diagnostics can print directly.
         match sc.read_envelope() {
             Ok(ready) if ready.event.as_deref() == Some("ready") => {
                 eprintln!("model loaded in {} ms", ready.load_ms.unwrap_or(0));
                 Ok(sc)
             }
             other => {
-                // The sidecar's own stderr explains the failure far better than
-                // "closed stdout" does, so surface it.
                 let detail: Vec<String> = sc.notices.try_iter().collect();
                 let reason = match other {
                     Ok(env) => format!("unexpected message: {:?}", env.error),
@@ -131,30 +152,53 @@ impl Sidecar {
         }
     }
 
-    /// Diagnostics from the sidecar. Drain these through the renderer — never
-    /// let them reach the terminal on their own.
+    /// Diagnostics captured from the sidecar's stderr.
+    ///
+    /// Drain these through the renderer. Writing them to the terminal directly
+    /// corrupts the frame the renderer is drawing.
     pub fn notices(&self) -> &Receiver<String> {
         &self.notices
     }
 
-    /// Transcribe a window. Blocks until the hypothesis comes back — measured
-    /// at ~130 ms for a 6 s buffer, well inside the tick interval.
+    /// Transcribes a window with no system prompt, blocking until it returns.
     ///
-    /// `Err` means the transport is broken and the session cannot continue.
-    /// A window the sidecar merely refused comes back as [`Reply::Failed`].
+    /// This is the ordinary path, taking nearly every window in a session.
+    /// Only audio reaches the model, so nothing the speaker said can bias the
+    /// result.
     ///
-    /// Audio only. There is deliberately no text field, and that is what keeps
-    /// the transcript away from the model: feeding it back as a prompt made the
-    /// model replay it verbatim whenever the window held no speech. The fixed
-    /// vocabulary hint is passed at [`spawn`](Sidecar::spawn) instead, precisely
-    /// so no per-window text path exists to be misused. See `asr_sidecar.py`.
+    /// # Errors
+    ///
+    /// Returns `Err` only when the transport is broken and the session cannot
+    /// continue. A window the sidecar refuses yields [`Reply::Failed`].
     pub fn transcribe(&mut self, pcm: &[f32]) -> Result<Reply> {
+        self.send(pcm, false)
+    }
+
+    /// Transcribes a window with the vocabulary hint given at [`Sidecar::spawn`].
+    ///
+    /// The hint improves recognition of command verbs but also biases ambiguous
+    /// audio toward the wake word, so it is reserved for re-deciding a finalized
+    /// utterance and is never applied to a window being dictated into.
+    ///
+    /// Only the prompt fixed at spawn can be selected; no prompt text may be
+    /// supplied here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sidecar::transcribe`].
+    pub fn transcribe_hinted(&mut self, pcm: &[f32]) -> Result<Reply> {
+        self.send(pcm, true)
+    }
+
+    /// Encodes and sends one window, then waits for its reply.
+    fn send(&mut self, pcm: &[f32], hint: bool) -> Result<Reply> {
         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         self.next_id += 1;
         let req = serde_json::json!({
             "id": self.next_id,
             "pcm": B64.encode(&bytes),
+            "hint": hint,
         });
 
         let stdin = self
@@ -175,32 +219,33 @@ impl Sidecar {
         }))
     }
 
-    /// Read until the reply to the request just sent.
+    /// Reads until the reply matching the request just sent.
     ///
-    /// The `id` check is what keeps the stream in step. stdout is supposed to
-    /// carry protocol only, but one stray line from a library inside the
-    /// sidecar would otherwise shift every later exchange by one: each window
-    /// would silently receive the *previous* window's hypothesis, forever, with
-    /// no error anywhere. Skipping unmatched lines resynchronises instead.
+    /// Banners and replies to earlier requests are skipped, which resynchronises
+    /// the stream if a stray line ever reaches stdout. Without the id check such
+    /// a line would offset every later exchange by one, silently pairing each
+    /// window with the previous window's hypothesis.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the stream closes, a line does not parse, or the sidecar
+    /// answers a request that was never sent.
     fn read_reply(&mut self) -> Result<Envelope> {
         loop {
             let env = self.read_envelope()?;
             match (env.event.as_deref(), env.id) {
-                // A banner, never a reply.
                 (Some(_), _) => continue,
                 (None, Some(id)) if id == self.next_id => return Ok(env),
-                // Left over from an earlier desynchronised exchange.
                 (None, Some(id)) if id < self.next_id => continue,
                 (None, Some(id)) => {
                     bail!("sidecar replied to request {id}, which was never sent")
                 }
-                // The sidecar could not attribute it — a request it failed to
-                // parse. It consumed our line, so this *is* our reply.
                 (None, None) => return Ok(env),
             }
         }
     }
 
+    /// Reads and parses the next line of the protocol stream.
     fn read_envelope(&mut self) -> Result<Envelope> {
         let mut line = String::new();
         let n = self.stdout.read_line(&mut line)?;
@@ -213,10 +258,9 @@ impl Sidecar {
 }
 
 impl Drop for Sidecar {
+    /// Closes stdin so the sidecar exits on EOF, then waits briefly before
+    /// killing it, so a request in flight is not truncated.
     fn drop(&mut self) {
-        // Closing stdin gives the sidecar EOF, so it unwinds its own read loop
-        // and releases MLX/multiprocessing resources cleanly. Kill only if it
-        // fails to take the hint.
         self.stdin.take();
 
         for _ in 0..50 {
