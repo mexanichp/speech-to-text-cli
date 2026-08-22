@@ -207,7 +207,7 @@ pub fn load(path: &Path) -> Result<Vec<Sentence>> {
         .lines()
         .map(|line| line.split_whitespace().map(str::to_string).collect::<Vec<_>>())
         .filter(|words| !words.is_empty())
-        .map(|words| Sentence { words })
+        .map(Sentence::settled)
         .collect())
 }
 
@@ -306,9 +306,7 @@ mod tests {
     use super::*;
 
     fn sentence(s: &str) -> Sentence {
-        Sentence {
-            words: s.split_whitespace().map(str::to_string).collect(),
-        }
+        Sentence::settled(s.split_whitespace().map(str::to_string).collect())
     }
 
     /// The timestamp only has to be sortable and human-legible, but a wrong

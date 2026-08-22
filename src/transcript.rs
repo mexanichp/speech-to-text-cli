@@ -33,19 +33,92 @@ use crate::repair::repair;
 use crate::text::{ends_sentence, normalize, opens_a_continuation, split_sentences};
 use std::collections::VecDeque;
 
+/// How far through the pipeline a finished sentence has come.
+///
+/// The two tiers exist because they make different promises. A settled
+/// sentence is what the recogniser heard, and the cleanup pass may still
+/// re-punctuate or re-segment it. A finalized one has been through that pass
+/// and is the deliverable.
+///
+/// The distinction is visible to the speaker rather than internal, which is the
+/// point: without it the screen would claim a permanence the pipeline does not
+/// have, since text does move after it goes plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// Transcribed and filed. The cleanup pass has not reached it.
+    Settled,
+    /// The cleanup pass has been over it. Nothing moves it but the speaker.
+    Finalized,
+}
+
+/// Whether the last sentence of a cleaned run is finalized with the rest.
+///
+/// The cleanup pass exists to join a sentence split across a trim seam, and it
+/// can only join what it is shown together. Batches used to abut exactly, so a
+/// seam falling on a batch boundary put the two halves in different passes and
+/// no pass ever saw both: the first half went finalized and out of scope while
+/// the second was still settled. Measured on a real session, the speaker got
+/// `but it seems.` as one finished sentence and `That it happened exactly
+/// between two paragraphs...` as the next, one tier apart, with nothing left
+/// that could put them back together.
+///
+/// [`Tail::Carry`] leaves the last sentence settled instead, so it opens the
+/// next batch and every adjacent pair is read together by some pass. It is the
+/// cheapest form of "give the pass more context": no larger batch, no larger
+/// model, and no finalized text ever edited, which is what including the
+/// previous batch's tail as context would have required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tail {
+    /// Finalize the whole run. Nothing follows that could join to it.
+    Close,
+    /// Hold the last sentence back, so the next batch begins with it.
+    Carry,
+}
+
 /// A finished sentence in the document.
 ///
-/// Deliberately just the words. There is no per-sentence approval flag any
-/// more: it made no sentence any more or less reachable, printable, copyable or
-/// recoverable than its neighbours, which is the whole of what this type is
-/// for.
+/// The words and how far they have come. There is no per-sentence approval flag
+/// any more: it made no sentence any more or less reachable, printable,
+/// copyable or recoverable than its neighbours, which is the whole of what this
+/// type is for. The tier is different, because it changes what the sentence is
+/// allowed to do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// One finished sentence in the document.
 pub struct Sentence {
     pub words: Vec<String>,
+    pub tier: Tier,
+    /// Whether a paragraph break belongs before this sentence.
+    ///
+    /// Set from the one signal the pipeline has that a speaker finished a
+    /// thought rather than drew breath: a hold that expired without a
+    /// continuation. Everything shorter merges, and merging is what says the
+    /// speaker was still going.
+    pub paragraph: bool,
+    /// Whether the audio behind this sentence was cut off at its end.
+    ///
+    /// A forced trim cuts the buffer at the best pause available, which is
+    /// often not the end of a sentence, so what is filed stops where the audio
+    /// stopped and the rest of the thought arrives as the next sentence. The
+    /// full stop between them is the recogniser's, not the speaker's.
+    ///
+    /// The host knows this at the moment it cuts. The cleanup pass, which is
+    /// given text and nothing else, has to infer it, and §11 records the case
+    /// where it cannot: both halves read as grammatical sentences and nothing
+    /// in the words says one of them was severed. This is that knowledge, kept
+    /// so it can be handed over.
+    pub cut: bool,
 }
 
 impl Sentence {
+    /// A sentence as the recogniser filed it.
+    pub fn settled(words: Vec<String>) -> Self {
+        Self { words, tier: Tier::Settled, paragraph: false, cut: false }
+    }
+
+    /// A sentence the cleanup pass has finished with.
+    pub fn finalized(words: Vec<String>) -> Self {
+        Self { words, tier: Tier::Finalized, paragraph: false, cut: false }
+    }
+
     /// The sentence as a single space-separated string.
     pub fn text(&self) -> String {
         self.words.join(" ")
@@ -100,6 +173,8 @@ pub struct Transcript {
     /// the buffer with nothing before it, and the tail then decodes as though it
     /// were a sentence of its own.
     filed_ends: VecDeque<u64>,
+    /// Set when the next sentence filed should open a paragraph.
+    opens_paragraph: bool,
 }
 
 /// Complete sentences held back in the window rather than filed.
@@ -117,12 +192,51 @@ pub struct Transcript {
 /// This is the blunt instrument if real dictation still splits sentences.
 const KEEP_SENTENCES: usize = 1;
 
+/// Words of the document searched for a repeat of incoming text.
+///
+/// Only the recent tail. A repeat arrives from a decode of audio still in the
+/// buffer, and the buffer is bounded, so a match further back than this is a
+/// coincidence rather than a re-file.
+const REPEAT_WINDOW: usize = 80;
+
+/// Shortest repeat at a trim seam worth removing.
+///
+/// Below this a match is as likely to be a coincidence as a seam: ordinary
+/// English repeats three-word runs all the time.
+const SEAM_MIN: usize = 4;
+
+/// Longest repeat looked for at a seam.
+const SEAM_MAX: usize = 16;
+
+/// Words of a seam repeat that buy one tolerated mismatch.
+///
+/// More generous than the budget used for filed text, and deliberately so. The
+/// two sides of a seam are decodes of the same speech with different amounts of
+/// right-context, so the second reading routinely differs by a word: `so this
+/// tool has to recognize` against `So this too has to recognize`. A budget
+/// tight enough to reject a coincidence would reject that too.
+const SEAM_TOLERANCE: usize = 4;
+
 /// Words of overlap that buy one tolerated edit when matching filed text.
 ///
-/// A run shorter than this must match exactly, which stops a coincidence being
-/// read as an overlap, while a sentence-length run survives the occasional
-/// re-tokenised word that re-decoding produces.
+/// A sentence-length run survives the occasional re-tokenised word that
+/// re-decoding produces, and a longer one survives proportionally more.
 const OVERLAP_TOLERANCE: usize = 8;
+
+/// Shortest run that is allowed a single edit regardless of the proportion.
+///
+/// The proportional budget alone floors at zero below [`OVERLAP_TOLERANCE`]
+/// words, which means a filed sentence shorter than that had to be re-decoded
+/// *exactly* to be recognised as filed. One inserted word defeated it outright:
+/// `So, not sure what's going on there.` was filed at an endpoint, the audio was
+/// merged back by a continuation, and the re-decode came back `So I'm not sure
+/// what's going on there.` Every alignment failed on the second word, the
+/// sentence read as unfiled, and the speaker got it twice.
+///
+/// Short runs still cannot be matched loosely: below this they must agree
+/// outright. What buys the edit is that every caller anchors the match against
+/// text believed to be in the buffer already, rather than searching for one.
+const OVERLAP_MIN_RUN: usize = 4;
 
 /// Filed words retained for the overlap test.
 ///
@@ -172,6 +286,7 @@ impl Transcript {
             undo: Vec::new(),
             revision: 0,
             filed: VecDeque::new(),
+            opens_paragraph: false,
             filed_words: 0,
             filed_base: 0,
             filed_ends: VecDeque::new(),
@@ -363,16 +478,49 @@ impl Transcript {
         words.len() - self.covered(&words)
     }
 
-    /// Leading words of a decode that are already filed, under whichever
-    /// alignment matches better.
+    /// Matches `words` against the record starting from a filed sentence end.
     ///
-    /// Both occur. `filed` normally starts where the buffer starts, which suits
-    /// a head decode, but a path that files without pruning can leave it
-    /// starting earlier, in which case the buffer aligns with its tail. Both
-    /// are anchored matches against text known to be in the buffer rather than
-    /// searches for a coincidence, so taking the larger answer is safe.
+    /// The third alignment, and the one the other two cannot express. A head
+    /// decode begins where the buffer begins. The record normally begins there
+    /// too, but not once an endpoint has filed whole sentences and a
+    /// continuation has spliced their audio back: the record then starts
+    /// *earlier* than the decode, so the front match misses, and the decode is
+    /// shorter than the record's tail, so the whole-tail match misses as well.
+    /// The text reads as unfiled and is filed a second time, which is the
+    /// duplicate a speaker sees.
+    ///
+    /// Anchored on the recorded sentence ends rather than on any offset. Those
+    /// are the only places a decode of restored audio can begin, and an
+    /// unanchored search over ordinary words finds a coincidence sooner or
+    /// later.
+    fn covered_from_a_boundary(&self, words: &[String]) -> usize {
+        let filed: Vec<&String> = self.filed.iter().collect();
+        self.filed_ends
+            .iter()
+            .filter_map(|&end| end.checked_sub(self.filed_base))
+            .filter_map(|at| usize::try_from(at).ok())
+            .filter(|&at| at < filed.len())
+            .map(|at| align(&filed[at..], words).1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Leading words of a decode that are already filed, under whichever
+    /// alignment matches best.
+    ///
+    /// All three occur. `filed` normally starts where the buffer starts, which
+    /// suits a head decode; a path that files without pruning can leave it
+    /// starting earlier, in which case the buffer aligns with its tail; and an
+    /// endpoint followed by a continuation leaves it starting earlier than a
+    /// decode that is also shorter than that tail, which only
+    /// [`Transcript::covered_from_a_boundary`] can see. Each is an anchored
+    /// match against text known to be in the buffer rather than a search for a
+    /// coincidence, so taking the largest answer is safe.
     fn covered(&self, words: &[String]) -> usize {
-        self.prefix_overlap(words).1.max(self.overlap(words))
+        self.prefix_overlap(words)
+            .1
+            .max(self.overlap(words))
+            .max(self.covered_from_a_boundary(words))
     }
 
     /// Counts leading agreed words that are safe to file now.
@@ -384,6 +532,26 @@ impl Transcript {
     }
 }
 
+/// Renders a document as flowing prose.
+///
+/// Sentences run together with a space and paragraphs break with a blank line,
+/// which is what the text has to look like to be pasted into anything that
+/// wraps its own lines. One sentence per line is right for a list and wrong for
+/// a paragraph, and dictation is mostly paragraphs.
+pub fn prose(document: &[Sentence]) -> String {
+    let mut out = String::new();
+    for sentence in document {
+        if !out.is_empty() {
+            out.push_str(if sentence.paragraph { "\n\n" } else { " " });
+        }
+        out.push_str(&sentence.text());
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 /// Aligns two word runs from their fronts, tolerating a few edits.
 ///
 /// Tolerates substitutions, insertions and deletions. A positional comparison
@@ -392,10 +560,11 @@ impl Transcript {
 /// nothing. Filed text then goes unrecognised, is not stripped, and is filed a
 /// second time, arriving split where the strip should have begun.
 ///
-/// The edit budget is proportional to the shorter run and floors at zero, so
-/// short runs must match exactly. This confirms a match already believed to be
-/// present rather than searching for a coincidental one, and over a handful of
-/// words a single free edit would match almost anything.
+/// The edit budget is proportional to the shorter run, with one edit allowed
+/// from [`OVERLAP_MIN_RUN`] words up. This confirms a match already believed to
+/// be present rather than searching for a coincidental one; below that length a
+/// single free edit would match almost anything, and above it the commoner
+/// failure is the reverse, a filed sentence going unrecognised over one word.
 ///
 /// # Returns
 ///
@@ -405,7 +574,9 @@ impl Transcript {
 /// wrong guess costs alignment length rather than falsely claiming text is
 /// filed.
 fn align(a: &[&String], b: &[String]) -> (usize, usize) {
-    let budget = a.len().min(b.len()) / OVERLAP_TOLERANCE;
+    let shorter = a.len().min(b.len());
+    let floor = usize::from(shorter >= OVERLAP_MIN_RUN && !crate::ablate::off("edit-floor"));
+    let budget = (shorter / OVERLAP_TOLERANCE).max(floor);
     let same = |x: &str, y: &str| normalize(x) == normalize(y);
 
     let (mut i, mut j, mut spent) = (0usize, 0usize, 0usize);
@@ -652,6 +823,51 @@ impl Transcript {
         if words.is_empty() {
             return;
         }
+        let paragraph = std::mem::take(&mut self.opens_paragraph);
+        let mut words = words;
+        // Order matters, and this is the order. The seam goes first, which
+        // takes the repeated words out of the document's tail; anything still
+        // matching after that is a stretch the document holds *elsewhere*,
+        // which is a different fault with a different answer.
+        //
+        // The other order does not work: a repeat that runs to the end of the
+        // document is a seam, but its shorter prefixes do not, so the stale
+        // check claims the seam one word early and truncates the wrong copy.
+        //
+        // Both run for a sentence opening a paragraph as well. They used to be
+        // skipped there, on the reasoning that a paragraph follows a silence
+        // long enough that nothing can have been decoded twice across it. That
+        // is an argument about the *audio*, and these two guards are about the
+        // text the document already holds: the settle files the held words and
+        // forgets the filed record in the same breath, so a paragraph opening
+        // was the one place in the pipeline with no duplicate defence at all.
+        let seam = self.drop_seam_repeat(&words);
+        words.drain(..seam.min(words.len()));
+        if words.is_empty() {
+            return;
+        }
+
+        // Asked repeatedly, because one answer can expose the next. Dropping a
+        // matched prefix leaves a remainder that is a different question, and
+        // on a real recording the remainder was a single word: six words of
+        // `First paragraph and second paragraph converge.` arrived behind text
+        // that already held five of them, and the one word left over became a
+        // sentence reading `Converge.` A stub like that is worse than either
+        // outcome it sits between — it keeps none of the meaning and costs a
+        // sentence boundary. Each pass drops at least one word, so this ends.
+        loop {
+            let stale = self.already_in_the_document(&words);
+            if stale == 0 {
+                break;
+            }
+            words.drain(..stale.min(words.len()));
+            if words.is_empty() {
+                return;
+            }
+            if crate::ablate::off("stale-loop") {
+                break;
+            }
+        }
         for word in &words {
             self.filed.push_back(word.clone());
         }
@@ -662,8 +878,212 @@ impl Transcript {
             self.filed_base += 1;
         }
         self.forget_stale_ends();
-        self.document.push(Sentence { words });
+        self.document.push(Sentence { paragraph, ..Sentence::settled(words) });
         self.revision += 1;
+    }
+
+    /// Whether two runs of the same length are the same words.
+    ///
+    /// A few substitutions are allowed in the middle, because the two copies
+    /// come from decodes of the same audio with different right-context and
+    /// routinely differ by a word. None are allowed at either end.
+    ///
+    /// The end anchors are what stop a run growing past where it matches. A
+    /// proportional budget spent at the tail lets a thirteen-word run with
+    /// three wrong words on the end read as a match, and those three words are
+    /// exactly the new ones the repeat is followed by.
+    fn same_run(a: &[&String], b: &[&String]) -> bool {
+        let n = a.len();
+        if n == 0 || n != b.len() {
+            return false;
+        }
+        let same = |x: &String, y: &String| normalize(x) == normalize(y);
+        same(a[0], b[0])
+            && same(a[n - 1], b[n - 1])
+            && a.iter().zip(b).filter(|(x, y)| !same(x, y)).count() <= n / SEAM_TOLERANCE
+    }
+
+    /// Whether two runs are two decodes of the same speech, at whatever lengths.
+    ///
+    /// [`Transcript::same_run`] compares position by position and so requires
+    /// the two copies to have the same number of words. A seam often does not:
+    /// the earlier copy was decoded with no right-context and the model guessed
+    /// a word the later copy does not have. Measured on one recording, twice in
+    /// the same session — `first paragraph and second paragraph connect,
+    /// converge` against `First paragraph and second paragraph converge`, and
+    /// `such artifacts like previous one` against `Such artifacts, like the
+    /// previous one`. Both read as new text, and the speaker got them twice.
+    ///
+    /// Both ends are still anchored exactly, which is what stops a run growing
+    /// past where it matches, and the budget in between is the same proportion
+    /// [`SEAM_TOLERANCE`] sets, spent on edits of any kind rather than on
+    /// substitutions alone.
+    fn same_speech(a: &[&String], b: &[&String]) -> bool {
+        if crate::ablate::off("same-speech") {
+            return Self::same_run(a, b);
+        }
+        let (n, m) = (a.len(), b.len());
+        if n == 0 || m == 0 {
+            return false;
+        }
+        let same = |x: &String, y: &String| normalize(x) == normalize(y);
+        if !same(a[0], b[0]) || !same(a[n - 1], b[m - 1]) {
+            return false;
+        }
+
+        let budget = n.min(m) / SEAM_TOLERANCE;
+        if n.abs_diff(m) > budget {
+            return false;
+        }
+
+        // Levenshtein over the two runs, which are bounded by `SEAM_MAX`.
+        let mut row: Vec<usize> = (0..=m).collect();
+        for (i, x) in a.iter().enumerate() {
+            let mut diagonal = row[0];
+            row[0] = i + 1;
+            for (j, y) in b.iter().enumerate() {
+                let cost = usize::from(!same(x, y));
+                let next = (row[j] + 1).min(row[j + 1] + 1).min(diagonal + cost);
+                diagonal = row[j + 1];
+                row[j + 1] = next;
+            }
+        }
+        row[m] <= budget
+    }
+
+    /// Leading words of `incoming` that the document already holds.
+    ///
+    /// A different repeat from the seam one, and it needs a different answer. A
+    /// forced trim files from a whole-buffer decode located by the head, and
+    /// when the filed-text strip fails to recognise its own output that decode
+    /// starts *inside* a sentence already in the document: `To know is how
+    /// exactly the algorithm commits the messages` arriving behind a sentence
+    /// that already says it. It matches no sentence boundary, so
+    /// [`Transcript::covered_from_a_boundary`] cannot see it, and it does not
+    /// sit at the document's end, so [`Transcript::drop_seam_repeat`] cannot
+    /// either.
+    ///
+    /// Here the *incoming* copy is the one to drop, the reverse of the seam
+    /// case: the words are already in the document in their proper place, and
+    /// what follows them in this decode is the only part that is new.
+    ///
+    /// Searched longest-first over the recent tail only, with the same
+    /// substitution budget a seam gets, since the two copies come from decodes
+    /// of the same audio with different context.
+    ///
+    /// Runs *after* [`Transcript::drop_seam_repeat`], which has by then taken
+    /// the seam out of the tail. A match ending at the tail's end is excluded
+    /// anyway, but only the ordering makes that exclusion reliable: the
+    /// shorter prefixes of an end-anchored repeat do not end at the end.
+    fn already_in_the_document(&self, incoming: &[String]) -> usize {
+        let tail: Vec<&String> = self
+            .document
+            .iter()
+            .flat_map(|s| s.words.iter())
+            .rev()
+            .take(REPEAT_WINDOW)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        let head: Vec<&String> = incoming.iter().collect();
+        let most = incoming.len().min(tail.len());
+        if let Some(k) = (SEAM_MIN..=most).rev().find(|&k| {
+            // Ending at the tail's end is the seam case, which
+            // `drop_seam_repeat` has already dealt with.
+            (0..tail.len().saturating_sub(k))
+                .any(|i| Self::same_run(&tail[i..i + k], &head[..k]))
+        }) {
+            return k;
+        }
+
+        // Below `SEAM_MIN` no substitution budget is affordable, so nothing
+        // above can see a two- or three-word fragment. Those exist: the forced
+        // trim files whatever the severed head decoded to, and on a real
+        // recording that put `Such artifacts, like.` into the document three
+        // words behind `...duplicates, such artifacts like previous one.` One
+        // word is enough to bother the speaker and too short for any tolerance,
+        // so the whole fragment has to match a run of the tail outright, and
+        // only then is it read as something the trim left behind.
+        let short = incoming.len() < SEAM_MIN
+            && incoming.len() <= tail.len()
+            && !crate::ablate::off("short-fragment");
+        let repeated = || {
+            tail.windows(incoming.len())
+                .any(|run| run.iter().zip(incoming).all(|(x, y)| normalize(x) == normalize(y)))
+        };
+        match short && !incoming.is_empty() && repeated() {
+            true => incoming.len(),
+            false => 0,
+        }
+    }
+
+    /// Drops a seam repeat from the tail of the sentence before this one.
+    ///
+    /// The trim cuts the audio at a pause and the head is decoded on its own, so
+    /// its last words were transcribed with no right-context at all, while the
+    /// next decode covers the same speech with the rest of the sentence behind
+    /// it. Where the two overlap the speaker sees their words twice, spelled
+    /// slightly differently the second time.
+    ///
+    /// The earlier copy is the one dropped, because it is the one decoded blind,
+    /// and because dropping the later one would leave the sentence that survives
+    /// starting mid-clause.
+    ///
+    /// Only a settled sentence is edited. A finalized one has been read in full
+    /// by the cleanup pass and is no longer the pipeline's to rewrite, so there
+    /// the *incoming* copy goes instead and the caller is told how much of it to
+    /// drop. That reverses the usual preference deliberately: the rule is to
+    /// keep the copy decoded with the most context, and a finalized sentence has
+    /// had more context than any decode. Refusing to act at all was the third
+    /// option and the wrong one, since nothing else can see this repeat —
+    /// [`Transcript::already_in_the_document`] excludes a run ending at the
+    /// tail's end, which is exactly what a seam is.
+    ///
+    /// Compared through [`Transcript::same_run`] rather than [`align`], since a
+    /// seam differs by substitution rather than by insertion, and an aligner
+    /// tolerant enough to absorb one over four words would match almost
+    /// anything.
+    ///
+    /// # Returns
+    ///
+    /// Leading words of `incoming` the caller must drop, which is zero whenever
+    /// this was able to edit the document itself.
+    fn drop_seam_repeat(&mut self, incoming: &[String]) -> usize {
+        let Some(prev) = self.document.last_mut() else {
+            return 0;
+        };
+
+        let tail: Vec<&String> = prev.words.iter().collect();
+        let head: Vec<&String> = incoming.iter().collect();
+        let most = tail.len().min(head.len()).min(SEAM_MAX);
+
+        // Longest first, and the two copies are allowed to disagree about how
+        // many words the overlap took. `cut` is what leaves the document's tail
+        // and `took` is what the incoming copy spends on the same speech; they
+        // differ by exactly the word one decode had and the other did not.
+        let found = (SEAM_MIN..=most).rev().find_map(|k| {
+            let widths = [k, k + 1, k.saturating_sub(1)];
+            widths.into_iter().find_map(|cut| {
+                let fits = cut >= SEAM_MIN && cut <= tail.len();
+                (fits && Self::same_speech(&tail[tail.len() - cut..], &head[..k]))
+                    .then_some((cut, k))
+            })
+        });
+        let Some((cut, took)) = found else {
+            return 0;
+        };
+
+        if prev.tier != Tier::Settled {
+            return took;
+        }
+        prev.words.truncate(prev.words.len() - cut);
+        if prev.words.is_empty() {
+            self.document.pop();
+        }
+        self.revision += 1;
+        0
     }
 
     /// Removes the newest sentence in the document.
@@ -773,6 +1193,124 @@ impl Transcript {
         &self.document
     }
 
+    /// Records that the newest sentence stops where the audio was cut.
+    ///
+    /// Called by the forced trim, which is the only thing that ends a sentence
+    /// for a reason having nothing to do with what the speaker said. The mark
+    /// is what [`Transcript::cleanup_batch`]'s caller hands to the pass so it
+    /// knows which full stop to distrust.
+    pub fn mark_cut(&mut self) {
+        if let Some(last) = self.document.last_mut() {
+            last.cut = true;
+        }
+    }
+
+    /// Records that the speaker stopped, so the next sentence opens a paragraph.
+    ///
+    /// Called where a hold expired rather than merged. That is the only place
+    /// the pipeline learns the difference between a pause and a full stop, and
+    /// it learns it by waiting rather than by reading the text, which §8 has
+    /// twice found does not carry the signal.
+    pub fn begin_paragraph(&mut self) {
+        self.opens_paragraph = !self.document.is_empty();
+    }
+
+    /// The oldest run of settled sentences far enough behind to be cleaned up.
+    ///
+    /// Holds back the newest `lag` sentences of the document. Those are close
+    /// enough to the speaker that a spoken command may still reach them, and
+    /// restructuring a sentence under a `delete` aimed at it is the one way the
+    /// cleanup pass could cost the speaker text rather than tidy it.
+    ///
+    /// Held to at least `min` sentences, which is what makes the pass worth
+    /// running at all. Its main job is to join a sentence that was split across
+    /// a trim seam, and a batch of one has nothing to join to: handed the
+    /// sentences one at a time it can only re-punctuate each in isolation,
+    /// which is the state it was brought in to repair.
+    ///
+    /// Capped at `max` so one pass cannot be handed an entire session, which
+    /// would make its cost grow without bound as the document does.
+    ///
+    /// Contiguous by construction: it stops at the first sentence that is not
+    /// settled, so a finalized sentence restored by `undo` cannot be swept back
+    /// through the pass.
+    pub fn cleanup_batch(
+        &self,
+        lag: usize,
+        min: usize,
+        max: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let from = self.document.iter().position(|s| s.tier == Tier::Settled)?;
+        let run_end = self.document[from..]
+            .iter()
+            .position(|s| s.tier != Tier::Settled)
+            .map_or(self.document.len(), |k| from + k);
+
+        let limit = self.document.len().saturating_sub(lag).min(run_end);
+        (limit.saturating_sub(from) >= min.max(1)).then(|| from..limit.min(from + max))
+    }
+
+    /// Replaces a settled run with the cleanup pass's reading of it.
+    ///
+    /// An empty `replacement` marks the run finalized where it stands, which is
+    /// what a refused or unusable pass gets. Forward progress either way: a run
+    /// that stayed settled would be offered to the next pass forever.
+    ///
+    /// # What this deliberately does not touch
+    ///
+    /// [`Transcript::filed`] keeps the recogniser's words, not these. It exists
+    /// to strip text already filed out of the *next hypothesis*, and the next
+    /// hypothesis comes from the audio, so it has to describe what the audio
+    /// decodes to. The document describes what the speaker gets. Letting the
+    /// cleanup pass edit both would break stripping for any sentence whose
+    /// audio is still in the buffer.
+    ///
+    /// The undo stack is likewise untouched. Undo takes back what the *speaker*
+    /// removed, and the cleanup pass is not the speaker; putting its edits on
+    /// that stack would make `undo` mean two different things.
+    pub fn finalize(
+        &mut self,
+        range: std::ops::Range<usize>,
+        replacement: Vec<Vec<String>>,
+        tail: Tail,
+    ) {
+        if range.start >= self.document.len() {
+            return;
+        }
+        let range = range.start..range.end.min(self.document.len());
+
+        if replacement.is_empty() {
+            for sentence in &mut self.document[range] {
+                sentence.tier = Tier::Finalized;
+            }
+        } else {
+            // The paragraph break belongs to the position, not to the words,
+            // so it stays with whatever now stands first in the run.
+            let opens = self.document[range.clone()]
+                .first()
+                .is_some_and(|s| s.paragraph);
+            let mut cleaned: Vec<Sentence> = replacement
+                .into_iter()
+                .filter(|w| !w.is_empty())
+                .map(Sentence::finalized)
+                .collect();
+            if let Some(first) = cleaned.first_mut() {
+                first.paragraph = opens;
+            }
+            // Carried only when something is left to finalize. A reply that
+            // joined the whole run into one sentence has nothing to hand
+            // forward, and holding it back would leave the batch starting where
+            // it started and growing, forever.
+            if tail == Tail::Carry && cleaned.len() > 1
+                && let Some(last) = cleaned.last_mut()
+            {
+                last.tier = Tier::Settled;
+            }
+            self.document.splice(range, cleaned);
+        }
+        self.revision += 1;
+    }
+
     /// Document version, compared only for equality.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -822,6 +1360,380 @@ mod tests {
         }
         let n = t.settled_prefix();
         t.file_settled(n)
+    }
+
+    /// A batch of one has nothing to join to, which is the pass's whole job.
+    #[test]
+    fn a_cleanup_batch_is_held_back_until_it_is_worth_running() {
+        let mut t = Transcript::new(2);
+        for i in 0..6 {
+            t.push_sentence(words(&format!("Sentence number {i}.")));
+        }
+
+        // Six settled, three held back for spoken commands: three available,
+        // which is below the minimum worth sending.
+        assert_eq!(t.cleanup_batch(3, 4, 12), None);
+
+        t.push_sentence(words("One more."));
+        assert_eq!(t.cleanup_batch(3, 4, 12), Some(0..4));
+        assert_eq!(t.cleanup_batch(3, 4, 2), Some(0..2), "capped by max");
+        assert_eq!(t.cleanup_batch(0, 1, 12), Some(0..7), "the flush takes it all");
+    }
+
+    /// The pass has to make progress even when it says nothing useful, or the
+    /// same run is offered to it forever.
+    /// The defect this exists for. A sentence split across a trim seam is only
+    /// joinable by a pass that sees both halves, and abutting batches put a
+    /// seam that lands on a batch boundary permanently out of reach: the first
+    /// half finalized with its batch, the second opened the next one.
+    ///
+    /// The property to hold is not "batches overlap" but "no adjacent pair is
+    /// split", so the test asks the second batch whether it starts on the
+    /// sentence the first one ended on.
+    /// The tail the pass never reaches during a session is `lag + min`
+    /// sentences deep. `min` is what decides how deep, and `lag` is the floor
+    /// nothing may reach, because a spoken command may still be aimed there.
+    /// Both are arguments rather than constants precisely so this is testable
+    /// and so §9 can sweep them.
+    #[test]
+    fn the_minimum_sets_the_reach_and_the_lag_is_the_floor() {
+        let mut t = Transcript::new(3);
+        for s in ["One.", "Two.", "Three.", "Four.", "Five."] {
+            file(&mut t, s);
+        }
+
+        assert_eq!(t.cleanup_batch(3, 4, 12), None, "a full batch is not there yet");
+        assert_eq!(
+            t.cleanup_batch(3, 2, 12),
+            Some(0..2),
+            "a quiet document gives up everything but the lag"
+        );
+        assert_eq!(
+            t.document().len() - 2,
+            3,
+            "and what it holds back is exactly the lag"
+        );
+    }
+
+    #[test]
+    fn the_next_batch_begins_where_the_last_one_ended() {
+        let mut t = Transcript::new(3);
+        for s in ["One.", "Two.", "Three.", "Four.", "Five.", "Six.", "Seven.", "Eight."] {
+            file(&mut t, s);
+        }
+
+        let first = t.cleanup_batch(3, 4, 12).expect("enough settled sentences");
+        let ended_on = t.document()[first.end - 1].text();
+        let reply: Vec<Vec<String>> =
+            t.document()[first.clone()].iter().map(|s| s.words.clone()).collect();
+        t.finalize(first.clone(), reply, Tail::Carry);
+
+        for s in ["Nine.", "Ten.", "Eleven.", "Twelve."] {
+            file(&mut t, s);
+        }
+        let second = t.cleanup_batch(3, 4, 12).expect("a second batch");
+        assert_eq!(
+            t.document()[second.start].text(),
+            ended_on,
+            "the seam between the two batches has to be inside one of them"
+        );
+        assert_eq!(second.start, first.end - 1, "overlapping by exactly one");
+    }
+
+    /// The carry may not stall the pass. A reply that joined a whole batch into
+    /// one sentence has nothing to hand forward, and holding that one back
+    /// would leave the next batch starting where this one started.
+    #[test]
+    fn a_batch_joined_into_one_sentence_is_still_finalized() {
+        let mut t = Transcript::new(3);
+        for s in ["One.", "Two.", "Three.", "Four.", "Five.", "Six.", "Seven.", "Eight."] {
+            file(&mut t, s);
+        }
+        let range = t.cleanup_batch(3, 4, 12).expect("a batch");
+        t.finalize(range.clone(), vec![words("One two three four five.")], Tail::Carry);
+
+        assert_eq!(t.document()[0].tier, Tier::Finalized, "forward progress or nothing moves");
+
+        for s in ["Nine.", "Ten.", "Eleven.", "Twelve."] {
+            file(&mut t, s);
+        }
+        assert_eq!(
+            t.cleanup_batch(3, 4, 12).map(|r| r.start),
+            Some(1),
+            "the next batch has to start past the joined sentence"
+        );
+    }
+
+    #[test]
+    fn a_refused_batch_is_finalized_where_it_stands() {
+        let mut t = Transcript::new(2);
+        for i in 0..8 {
+            t.push_sentence(words(&format!("Sentence number {i}.")));
+        }
+        let range = t.cleanup_batch(3, 4, 12).expect("a batch");
+        let before: Vec<Vec<String>> = t.document()[range.clone()]
+            .iter()
+            .map(|s| s.words.clone())
+            .collect();
+
+        t.finalize(range.clone(), Vec::new(), Tail::Close);
+
+        assert!(t.document()[range.clone()].iter().all(|s| s.tier == Tier::Finalized));
+        assert_eq!(
+            t.document()[range.clone()]
+                .iter()
+                .map(|s| s.words.clone())
+                .collect::<Vec<_>>(),
+            before,
+            "refusing must not change a word"
+        );
+        let next = t.cleanup_batch(3, 4, 12);
+        assert!(next.is_none_or(|r| r.start >= range.end), "never offered again");
+    }
+
+    /// Joining two settled sentences into one is the pass's ordinary output.
+    #[test]
+    fn a_cleanup_reply_replaces_the_run_it_was_given() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words("Keep me."));
+        t.push_sentence(words("The product behaves on."));
+        t.push_sentence(words("Such a long pause."));
+
+        t.finalize(1..3, vec![words("The product behaves on such a long pause.")], Tail::Close);
+
+        assert_eq!(t.document().len(), 2);
+        assert_eq!(t.document()[1].text(), "The product behaves on such a long pause.");
+        assert_eq!(t.document()[1].tier, Tier::Finalized);
+        assert_eq!(t.document()[0].tier, Tier::Settled, "outside the run, untouched");
+    }
+
+    /// The seam repeat the speaker actually sees, with the substitution that
+    /// stops an exact comparison finding it.
+    #[test]
+    fn a_seam_repeat_loses_the_copy_that_was_decoded_blind() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words(
+            "Pick lots of words in just a matter of seconds, so this tool has to recognize.",
+        ));
+        t.push_sentence(words("So this too has to recognize both of these scenarios."));
+
+        assert_eq!(
+            t.document()[0].text(),
+            "Pick lots of words in just a matter of seconds,",
+            "the blind tail goes, the sentence that survives keeps its start"
+        );
+        assert_eq!(
+            t.document()[1].text(),
+            "So this too has to recognize both of these scenarios."
+        );
+    }
+
+    /// The other repeat, taken from a run where the filed-text strip failed and
+    /// a forced trim filed a slice from the middle of a sentence the document
+    /// already held. It matches no sentence boundary and does not sit at the
+    /// document's end, so neither of the other two guards can see it.
+    #[test]
+    fn text_the_document_already_holds_elsewhere_is_not_filed_again() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words(
+            "What is too important to know is how exactly the algorithm commits the \
+             messages, and whether or not it commits them.",
+        ));
+        t.push_sentence(words(
+            "To know is how exactly the algorithm commits the messages, and whether or not.",
+        ));
+
+        assert_eq!(t.document().len(), 1, "the whole re-file was already on record");
+    }
+
+    /// The same guard must not swallow the new words behind a repeat.
+    ///
+    /// A sentence stands between the repeat and the document's end here, which
+    /// is what makes it a re-file rather than a seam.
+    #[test]
+    fn only_the_repeated_opening_is_dropped() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words(
+            "What is too important to know is how exactly the algorithm commits the messages.",
+        ));
+        t.push_sentence(words("Alternatively, many things could go wrong."));
+        t.push_sentence(words(
+            "To know is how exactly the algorithm commits the messages, and whether or not.",
+        ));
+
+        assert_eq!(t.document().len(), 3);
+        assert_eq!(t.document()[2].text(), "and whether or not.");
+    }
+
+    /// A seam whose two copies disagree about how many words the overlap took.
+    /// Both measured on one recording, and neither is visible to a matcher that
+    /// compares position by position: the lengths differ, so it declines before
+    /// it looks at a word.
+    #[test]
+    fn a_seam_repeat_survives_a_word_only_one_copy_has() {
+        let mut t = Transcript::new(2);
+        file(&mut t, "Also, when the first paragraph and second paragraph connect, converge.");
+        file(&mut t, "First paragraph and second paragraph converge.");
+
+        assert_eq!(
+            texts(&t),
+            vec![
+                "Also, when the".to_string(),
+                "First paragraph and second paragraph converge.".to_string()
+            ],
+            "the blind copy gives up the overlap, the later one keeps it"
+        );
+    }
+
+    #[test]
+    fn a_seam_repeat_survives_an_inserted_article() {
+        let mut t = Transcript::new(2);
+        file(
+            &mut t,
+            "Obviously, there could be some duplicates, like audio duplicates, such artifacts like previous one.",
+        );
+        file(&mut t, "Such artifacts, like the previous one, I saw, was clear.");
+
+        assert_eq!(
+            texts(&t),
+            vec![
+                "Obviously, there could be some duplicates, like audio duplicates,".to_string(),
+                "Such artifacts, like the previous one, I saw, was clear.".to_string()
+            ],
+            "one copy of the overlap, and it is the one decoded with context"
+        );
+    }
+
+    /// Dropping a matched prefix can leave a remainder that is itself a
+    /// repeat, and a one-word remainder is the worst of both outcomes: it keeps
+    /// none of the meaning and costs a sentence boundary. Measured, it read
+    /// `Converge.`
+    #[test]
+    fn a_repeat_that_would_leave_a_stub_is_dropped_whole() {
+        let mut t = Transcript::new(2);
+        file(&mut t, "Also, when the first paragraph and second paragraph can vary, converge.");
+        file(&mut t, "First paragraph and second paragraph converge.");
+
+        assert_eq!(texts(&t).len(), 1, "no stub left behind: {:?}", texts(&t));
+    }
+
+    /// The forced trim knows the full stop it just created is its own, and the
+    /// cleanup pass cannot tell from the words. The mark is how it is told.
+    #[test]
+    fn a_forced_cut_marks_the_sentence_it_ended() {
+        let mut t = Transcript::new(2);
+        file(&mut t, "It has already everything in place.");
+        assert!(!t.document()[0].cut, "nothing has been cut yet");
+
+        t.mark_cut();
+        assert!(t.document()[0].cut);
+
+        file(&mut t, "And to eliminate any duplicates as we go.");
+        assert!(t.document()[0].cut, "the mark stays with the sentence it describes");
+        assert!(!t.document()[1].cut, "and does not spread to the next one");
+    }
+
+    /// The looser matcher must not turn into one that matches anything. Two
+    /// runs that happen to start and end alike are not the same speech.
+    #[test]
+    fn a_run_that_only_shares_its_ends_is_not_a_seam() {
+        let mut t = Transcript::new(2);
+        file(&mut t, "The build failed because the tests were flaky today.");
+        file(&mut t, "The release went out without a hitch today.");
+
+        assert_eq!(texts(&t).len(), 2, "nothing here is a repeat: {:?}", texts(&t));
+        assert!(texts(&t)[0].ends_with("today."), "the first sentence is untouched");
+    }
+
+    /// A fragment too short for any tolerance to reach. The forced trim files
+    /// whatever the severed head decoded to, and on a real recording that put
+    /// `Such artifacts, like.` into the document three words behind the sentence
+    /// that already said it. Nothing above `SEAM_MIN` can see three words.
+    #[test]
+    fn a_short_fragment_the_document_already_holds_is_dropped() {
+        let mut t = Transcript::new(2);
+        file(
+            &mut t,
+            "Obviously, there could be some duplicates, like audio duplicates, such artifacts like previous one.",
+        );
+        file(&mut t, "Such artifacts, like.");
+
+        assert_eq!(texts(&t).len(), 1, "the fragment is a repeat: {:?}", texts(&t));
+    }
+
+    /// The short match has to be exact, or every `Yes.` in a session collapses
+    /// into the first one.
+    #[test]
+    fn a_short_sentence_the_document_does_not_hold_survives() {
+        let mut t = Transcript::new(2);
+        file(&mut t, "Obviously, there could be some duplicates, like audio duplicates.");
+        file(&mut t, "Such artifacts, though.");
+
+        assert_eq!(texts(&t).len(), 2, "nothing in the tail says this: {:?}", texts(&t));
+    }
+
+    /// A finalized sentence has been read in full by the pass and is no longer
+    /// the pipeline's to edit.
+    #[test]
+    fn a_seam_repeat_never_edits_finalized_text() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words("So this tool has to recognize."));
+        t.finalize(0..1, Vec::new(), Tail::Close);
+        t.push_sentence(words("So this tool has to recognize both of these."));
+
+        assert_eq!(t.document().len(), 2);
+        assert_eq!(t.document()[0].text(), "So this tool has to recognize.");
+        assert_eq!(
+            t.document()[1].text(),
+            "both of these.",
+            "the finalized copy stands, so the incoming one gives up the repeat"
+        );
+    }
+
+    /// What the clipboard carries.
+    #[test]
+    fn prose_runs_sentences_together_and_breaks_paragraphs() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words("First thought."));
+        t.push_sentence(words("Still the same one."));
+        t.begin_paragraph();
+        t.push_sentence(words("A new one."));
+
+        assert_eq!(
+            prose(t.document()),
+            "First thought. Still the same one.\n\nA new one.\n"
+        );
+        assert_eq!(prose(&[]), "", "nothing to deliver is not a blank line");
+    }
+
+    /// The duplicate a speaker actually sees, reduced to the state that causes
+    /// it.
+    ///
+    /// An endpoint files whole sentences while their audio sits in the held
+    /// utterance; a continuation splices that audio back to the front of the
+    /// buffer; the trim then decodes a head of it. The record starts earlier
+    /// than that decode, so no front match is possible, and the decode is
+    /// shorter than the record's tail, so no whole-tail match is possible
+    /// either. Read as unfiled, the sentence is filed a second time.
+    #[test]
+    fn a_head_decode_of_restored_audio_is_recognised_as_filed() {
+        let mut t = Transcript::new(2);
+        t.push_sentence(words("Alpha beta gamma delta."));
+        t.push_sentence(words(
+            "So my entire speech represents both the quick passage and the slow passage.",
+        ));
+
+        assert_eq!(
+            t.unfiled("So my entire speech represents both."),
+            0,
+            "every word of this head is already in the document"
+        );
+        assert_eq!(
+            t.unfiled("So my entire speech represents both the quick passage and the slow \
+                       passage. Thank you for your attention."),
+            5,
+            "and only the words past it are new"
+        );
     }
 
     /// Nothing files until a sentence has [`KEEP_SENTENCES`] complete sentences
@@ -1025,6 +1937,42 @@ mod tests {
             t.unfiled(seen),
             0,
             "an inserted word must not make filed text look new"
+        );
+    }
+
+    /// The same hazard on a run too short for a proportional budget to buy an
+    /// edit, which is the shape it actually took on a real recording.
+    ///
+    /// `So, not sure what's going on there.` was filed at an endpoint, the
+    /// continuation spliced its audio back into the buffer, and the re-decode
+    /// came back `So I'm not sure what's going on there.` Seven words, one
+    /// insertion, and every alignment failed on the second word: the speaker
+    /// got the sentence twice.
+    #[test]
+    fn a_short_filed_sentence_survives_one_inserted_word() {
+        let mut t = Transcript::new(3);
+        file(&mut t, "So, not sure what's going on there.");
+
+        let seen = "So I'm not sure what's going on there.";
+        assert_eq!(
+            t.unfiled(seen),
+            0,
+            "the sentence is filed; nothing here is new: {:?}",
+            texts(&t)
+        );
+    }
+
+    /// The floor is a floor, not a licence. Three words must still agree
+    /// outright, or an overlap becomes something the aligner can find anywhere.
+    #[test]
+    fn a_run_below_the_floor_still_matches_exactly() {
+        let mut t = Transcript::new(3);
+        file(&mut t, "Ship it.");
+        let seen = "Skip it.";
+        assert_eq!(
+            t.unfiled(seen),
+            seen.split_whitespace().count(),
+            "two words that differ are not an overlap"
         );
     }
 
@@ -1322,8 +2270,8 @@ mod tests {
     fn restore_seeds_the_document() {
         let mut t = Transcript::new(2);
         t.restore(vec![
-            Sentence { words: words("From last time.") },
-            Sentence { words: words("And more.") },
+            Sentence::settled(words("From last time.")),
+            Sentence::settled(words("And more.")),
         ]);
 
         assert_eq!(texts(&t), vec!["From last time.", "And more."]);
@@ -1341,7 +2289,7 @@ mod tests {
     #[test]
     fn rollback_cannot_reach_a_restored_session() {
         let mut t = Transcript::new(2);
-        t.restore(vec![Sentence { words: words("Recovered.") }]);
+        t.restore(vec![Sentence::settled(words("Recovered."))]);
         assert_eq!(t.rollback(), None);
         assert_eq!(texts(&t), vec!["Recovered."]);
     }

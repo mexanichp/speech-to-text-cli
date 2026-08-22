@@ -14,6 +14,22 @@ const TERMINALS: [char; 6] = ['.', '!', '?', '\u{3002}', '\u{ff1f}', '\u{ff01}']
 /// Punctuation that joins clauses rather than ending them.
 const JOINERS: [char; 5] = [',', ';', ':', '\u{3001}', '\u{ff0c}'];
 
+/// The line with its sentence-final stop taken off, if it had one.
+///
+/// How the host tells the cleanup pass that a full stop is the recogniser's
+/// rather than the speaker's. A line that stops without one reads as
+/// unfinished, which is exactly what it is when a forced trim cut the audio
+/// there, and the pass's own rules already say to join a line that carries on
+/// into the next.
+///
+/// Marking by *removal* rather than with a token is what makes this safe to
+/// send: there is no marker for the model to copy into its reply, nothing to
+/// strip out of the reply afterwards, and no word for the content check to
+/// read as invented.
+pub fn unterminated(line: &str) -> String {
+    line.trim_end().trim_end_matches(TERMINALS).trim_end().to_string()
+}
+
 /// Reports whether a word closes a sentence.
 ///
 /// Trailing quotes and brackets are ignored, so `end."` still closes.
@@ -472,6 +488,21 @@ mod tests {
         assert_eq!(
             split_sentences("Really?! I had no idea..."),
             vec!["Really?!", "I had no idea..."]
+        );
+    }
+
+    /// The mark handed to the cleanup pass is the absence of a full stop, so it
+    /// has to come off cleanly and leave everything else alone.
+    #[test]
+    fn a_line_gives_up_its_sentence_final_stop() {
+        assert_eq!(unterminated("It has already everything in place."), "It has already everything in place");
+        assert_eq!(unterminated("Is that so?"), "Is that so");
+        assert_eq!(unterminated("Wait!"), "Wait");
+        assert_eq!(unterminated("\u{305d}\u{3046}\u{3067}\u{3059}\u{3002}"), "\u{305d}\u{3046}\u{3067}\u{3059}");
+        assert_eq!(
+            unterminated("The U.S. government said so"),
+            "The U.S. government said so",
+            "nothing to take off, and the abbreviation is not a stop"
         );
     }
 }

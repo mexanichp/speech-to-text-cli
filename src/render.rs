@@ -15,7 +15,7 @@
 //! | rendering | meaning |
 //! |---|---|
 //! | dim | the pipeline may still rewrite this |
-//! | plain | filed; only the speaker can change it now |
+//! | plain | filed; the recogniser is finished with these words |
 //!
 //! Everything in flight is dim, whether or not agreement has promoted it, and
 //! text becomes plain when it files. Agreement is not rendered: inside an
@@ -23,8 +23,20 @@
 //! word, so a plain word there would be claiming a permanence the pipeline does
 //! not have.
 //!
-//! The gutter answers a different question, namely whether a row belongs to the
-//! utterance being spoken now or to the transcript behind it.
+//! The gutter carries the tier, which is a different question from intensity:
+//! not "will these words change?" but "how far through the pipeline is this
+//! row?".
+//!
+//! | gutter | tier |
+//! |---|---|
+//! | `\u{2502}` | the utterance in flight |
+//! | `\u{00b7}` | settled; the cleanup pass has not reached it |
+//! | blank | finalized; only the speaker moves it now |
+//!
+//! Settled text is plain and still carries a mark, because the cleanup pass may
+//! re-punctuate or re-join it. Leaving it unmarked would claim it was finished
+//! when it is not, and dimming it would say the recogniser might still change
+//! the words, which it will not.
 //!
 //! # Invariants
 //!
@@ -39,7 +51,7 @@
 //! Each frame addresses every row by absolute position and clears it before
 //! painting, so no state carries between frames and the layout cannot drift.
 
-use crate::transcript::Sentence;
+use crate::transcript::{Sentence, Tier};
 use std::io::{IsTerminal, Write, stdout};
 
 const DIM: &str = "\x1b[2m";
@@ -52,6 +64,9 @@ const CURSOR_SHOW: &str = "\x1b[?25h";
 
 /// Marks the utterance in flight, as against the transcript behind it.
 const LIVE_MARK: char = '\u{2502}';
+
+/// Marks a settled row the cleanup pass has not been over yet.
+const SETTLED_MARK: char = '\u{00b7}';
 
 /// Marks the top row when more transcript exists above than fits on screen.
 ///
@@ -93,8 +108,10 @@ pub struct Frame<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Marker drawn in the left margin of a row.
 enum Gutter {
-    /// A filed sentence: the pipeline is finished with it.
+    /// A finalized sentence: the pipeline is finished with it.
     None,
+    /// A filed sentence the cleanup pass has not reached.
+    Settled,
     /// The utterance in flight, settling or still being spoken.
     Live,
     /// Top row only: there is more transcript above than the screen holds.
@@ -213,6 +230,10 @@ impl Renderer {
     /// This is the only point at which anything reaches the scrollback, and the
     /// point at which the text stops being editable. Every sentence is written
     /// unconditionally.
+    ///
+    /// Written as prose rather than a sentence per line, matching what the
+    /// clipboard carries: the live view breaks by sentence so a spoken command
+    /// has a visible target, but the thing being delivered is a paragraph.
     pub fn finish(&mut self, document: &[Sentence]) {
         if self.tty {
             let mut out = stdout().lock();
@@ -222,9 +243,7 @@ impl Renderer {
         }
 
         let mut out = stdout().lock();
-        for sentence in document {
-            let _ = writeln!(out, "{}", sentence.text());
-        }
+        let _ = write!(out, "{}", crate::transcript::prose(document));
         let _ = out.flush();
     }
 }
@@ -286,12 +305,13 @@ fn build_rows<'a>(frame: &Frame<'a>, text_w: usize, max_rows: usize) -> Vec<Row<
             elided = true;
             break;
         }
+        let gutter = match sentence.tier {
+            Tier::Settled => Gutter::Settled,
+            Tier::Finalized => Gutter::None,
+        };
         let cells = sentence.words.iter().map(|w| (w.as_str(), false));
         for cells in wrap(cells, text_w).into_iter().rev() {
-            rows.push(Row {
-                gutter: Gutter::None,
-                cells,
-            });
+            rows.push(Row { gutter, cells });
         }
     }
 
@@ -310,6 +330,7 @@ fn style_row(row: &Row, gutter_w: usize) -> String {
     if gutter_w > 0 {
         match row.gutter {
             Gutter::Live => out.push_str(&format!("{DIM}{LIVE_MARK}{RESET} ")),
+            Gutter::Settled => out.push_str(&format!("{DIM}{SETTLED_MARK}{RESET} ")),
             Gutter::More => out.push_str(&format!("{DIM}{MORE_MARK}{RESET} ")),
             Gutter::None => out.push_str(&" ".repeat(gutter_w)),
         }
@@ -434,7 +455,7 @@ mod tests {
     }
 
     fn sentence(s: &str) -> Sentence {
-        Sentence { words: words(s) }
+        Sentence::settled(words(s))
     }
 
     fn frame<'a>(
@@ -493,20 +514,42 @@ mod tests {
     /// Filed sentences are the transcript however recently they were filed, so
     /// none of them carries it — including the one filed a moment ago.
     #[test]
-    fn the_gutter_marks_the_live_tail_and_nothing_else() {
-        let doc = [sentence("Filed a while ago."), sentence("Filed just now.")];
+    fn the_gutter_carries_the_tier() {
+        let doc = [
+            Sentence::finalized(words("Cleaned up a while ago.")),
+            Sentence::settled(words("Filed just now.")),
+        ];
         let committed = words("still");
         let provisional = words("speaking");
         let rows = build_rows(&frame(&doc, &committed, &provisional), 40, 5);
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].gutter, Gutter::None);
-        assert_eq!(rows[1].gutter, Gutter::None);
+        assert_eq!(rows[0].gutter, Gutter::None, "finalized carries no mark");
+        assert_eq!(rows[1].gutter, Gutter::Settled, "settled is marked");
         assert_eq!(rows[2].gutter, Gutter::Live, "the in-flight row");
 
         assert!(style_row(&rows[0], 2).starts_with("  "));
-        assert!(style_row(&rows[1], 2).starts_with("  "));
+        assert!(style_row(&rows[1], 2).contains(SETTLED_MARK));
         assert!(style_row(&rows[2], 2).contains(LIVE_MARK));
+    }
+
+    /// The tier is a gutter mark and nothing more. Both tiers of the document
+    /// render plain, because the recogniser is finished with both: what the
+    /// cleanup pass may still change is where the sentences break, not which
+    /// words are in them.
+    #[test]
+    fn both_document_tiers_render_plain() {
+        let doc = [
+            Sentence::finalized(words("Cleaned up.")),
+            Sentence::settled(words("Not yet.")),
+        ];
+        let empty = Vec::new();
+        let rows = build_rows(&frame(&doc, &empty, &empty), 40, 5);
+
+        for row in &rows {
+            let line = style_line(&row.cells);
+            assert!(!line.contains(DIM), "document text must be plain, got {line:?}");
+        }
     }
 
     /// The gutter is not the dim/plain axis, and it is now the *only* thing
@@ -533,9 +576,11 @@ mod tests {
     fn text_never_moves_from_plain_back_to_dim() {
         let doc = [sentence("Filed earlier.")];
 
+        // Both document tiers count as plain here: the axis under test is
+        // dim against plain, not which tier a filed row sits in.
         let plain_rows = |rows: &[Row]| -> Vec<String> {
             rows.iter()
-                .filter(|r| r.gutter == Gutter::None)
+                .filter(|r| matches!(r.gutter, Gutter::None | Gutter::Settled))
                 .map(|r| style_line(&r.cells))
                 .collect()
         };

@@ -8,6 +8,8 @@
 //! trims the audio buffer, applies spoken commands and drives the renderer.
 
 mod audio;
+mod ablate;
+mod cleanup;
 mod command;
 mod render;
 mod repair;
@@ -25,7 +27,7 @@ use render::Renderer;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use transcript::Transcript;
+use transcript::{Tail, Tier, Transcript};
 use vad::{FRAME, Vad, VadEvent};
 
 #[derive(Parser)]
@@ -66,8 +68,11 @@ struct Args {
     ///
     /// A floor rather than a fixed period: when inference on a long buffer
     /// outgrows it, the gap stretches so the duty cycle cannot exceed 100%.
-    /// Lowering it speeds up commitment on short buffers only.
-    #[arg(long, default_value_t = 500)]
+    ///
+    /// With the buffer held short this floor, not inference, is what sets
+    /// commit latency. It is set below the pass time deliberately, leaving duty
+    /// cycle spare for the cleanup pass to run in.
+    #[arg(long, default_value_t = 400)]
     interval_ms: u64,
 
     /// Hypotheses that must agree before a word stops being provisional.
@@ -93,18 +98,17 @@ struct Args {
     #[arg(long, default_value_t = vad::DEFAULT_OPEN_MS)]
     open_ms: u32,
 
-    /// Look for a place to trim the audio buffer once it passes this many
-    /// seconds.
+    /// Hold the audio buffer to roughly this many seconds.
     ///
-    /// Never cuts mid-word: it cuts at a silence the speaker already left, and
-    /// only where the text going with it has been filed. This bounds how far
-    /// behind the transcript can fall, since inference and commit latency both
-    /// grow with the buffer.
+    /// Never cuts mid-word: it cuts at a silence the speaker already left. Below
+    /// this the trim holds out for a sentence-grade pause and takes one only if
+    /// the text going with it is already filed; past it, the cut is taken at the
+    /// best pause available whether or not it lands on a sentence.
     ///
-    /// Values below 10 are accepted but warned about, because the buffer then
-    /// routinely passes the point at which the trim stops checking whether the
-    /// text it severs has been filed.
-    #[arg(long, default_value_t = 30)]
+    /// This is what bounds commit latency, because inference grows with the
+    /// buffer. A cut landing mid-sentence is repaired afterwards by the cleanup
+    /// pass, which is what makes holding to this bound affordable.
+    #[arg(long, default_value_t = 12)]
     trim_after_s: u64,
 
     /// Shortest silence, in milliseconds, before an utterance settles.
@@ -161,6 +165,26 @@ struct Args {
     #[arg(long)]
     quiet: bool,
 
+    /// Text model that re-reads settled sentences and repairs the seams.
+    ///
+    /// Runs in its own process, off the latency path, a few sentences behind the
+    /// speaker. It may re-punctuate, re-join and re-split; it may not introduce
+    /// a word that was not said, and a reply that does is discarded.
+    #[arg(long, default_value = "mlx-community/Qwen3-4B-4bit")]
+    cleanup_model: String,
+
+    /// Cleanup sidecar script.
+    #[arg(long, default_value = "sidecar/cleanup_sidecar.py")]
+    cleanup_script: PathBuf,
+
+    /// Leave settled sentences exactly as the recogniser filed them.
+    ///
+    /// The buffer is held short so live text keeps up, which cuts the audio at
+    /// pauses that are not always sentence boundaries. Without the cleanup pass
+    /// those cuts stay in the transcript.
+    #[arg(long)]
+    no_cleanup: bool,
+
     /// Python interpreter for the sidecar.
     #[arg(long, default_value = ".venv/bin/python")]
     python: PathBuf,
@@ -215,17 +239,13 @@ const EAGER_TRIM_DIVISOR: usize = 2;
 /// the longest gap is unchanged.
 const DESPERATE_TRIM_MULTIPLE: usize = 2;
 
-/// Multiple of the trim threshold past which the trim cuts regardless of
-/// whether the text it severs has been filed.
+/// Multiple of the trim threshold past which any recorded silence, refusals
+/// included, becomes a cut point, and failing that the quietest frame.
 ///
-/// Refusing to cut is bounded only while something else eventually files the
-/// text. For a speaker producing one very long sentence nothing does, and an
-/// unbounded buffer eventually stops the session responding.
-///
-/// Text filed here comes from a decode of the whole buffer where the two
-/// decodes can be aligned, so a forced cut does not by itself put a severed
-/// boundary in the document.
-const FORCED_TRIM_MULTIPLE: usize = 2;
+/// The band below the bands. Every other band filters the recorded gaps, and a
+/// filter over an empty list is empty, so a speaker who leaves no silence the
+/// detector calls quiet has no bound on the buffer without this.
+const LAST_RESORT_MULTIPLE: usize = 2;
 
 /// A silence the speaker left inside an utterance: somewhere the buffer may be
 /// cut without slicing a word.
@@ -257,6 +277,19 @@ struct Dip {
 /// the next window does not start from a sliver.
 const MIN_SEGMENT_SAMPLES: usize = audio::TARGET_RATE as usize * 2;
 
+/// Most audio one loop iteration will take from the capture channel.
+///
+/// The backlog is drained rather than sampled, because dropping capture buffers
+/// shreds the audio instead of degrading it. What is bounded is how much the
+/// detector is asked to swallow at once: past this the buffer runs ahead of the
+/// frames the detector has actually inspected, and the trim then reasons about
+/// audio no gap has been recorded in.
+///
+/// Nothing is discarded. Whatever is left stays in the channel and arrives on
+/// the next iteration, which is immediate: the loop only blocks when the
+/// channel is empty.
+const MAX_INGEST_SAMPLES: usize = audio::TARGET_RATE as usize * 2;
+
 /// Minimum gap between repeats of the same rate-limited notice.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
 
@@ -266,11 +299,30 @@ const NOTICE_EVERY: Duration = Duration::from_secs(10);
 /// Reported in preference to the duty cycle, which is pinned by construction
 /// and therefore says nothing. What degrades is the delay before a word stops
 /// being provisional, which is what the speaker sees.
+///
+/// The notice states the fact and asks for nothing. It used to tell the speaker
+/// to say `keep`, which made a machine that could not keep up into a chore for
+/// the person using it; the buffer bound is what handles this now, and where
+/// that is not enough there is nothing useful for the speaker to do mid-sentence.
 const COMMIT_TARGET: Duration = Duration::from_millis(2_000);
 
 /// Longest the live view may go without a repaint, so the settle countdown
 /// advances and notices expire on time.
 const REPAINT_EVERY: Duration = Duration::from_millis(200);
+
+/// Longest a spoken `copy` waits for the cleanup pass to catch up.
+///
+/// Shorter than the one at exit, because the session continues afterwards and
+/// audio arriving during the wait sits in the capture channel unscanned. The
+/// bound is what keeps that backlog inside one loop iteration's drain.
+const COPY_FLUSH_BUDGET: Duration = Duration::from_secs(6);
+
+/// Longest the cleanup pass is waited on at the end of a session.
+///
+/// Nothing is live any more, so the cost lands on the speaker's exit rather
+/// than on their latency, and the alternative is handing them a transcript
+/// with the seams still in it.
+const EXIT_FLUSH_BUDGET: Duration = Duration::from_secs(20);
 
 /// Set from a signal handler; the loop exits at the next iteration so the
 /// transcript is still written and the terminal still restored.
@@ -588,20 +640,30 @@ struct Scan {
     endpointed: bool,
 }
 
-/// Advances the detector over whole frames, stopping at an endpoint.
+/// Advances the detector over whole frames, stopping at the first boundary.
 ///
-/// Stopping is a correctness requirement. The main loop drains the whole
-/// capture backlog per iteration, so one call can cover as much audio as the
-/// last forward pass took — longer than the endpoint threshold, meaning a
-/// single batch can contain one utterance ending and the next beginning.
+/// Reports **at most one** of an onset and an endpoint, and stops there. Both
+/// halves of that are correctness requirements, and they were found the same
+/// way: one call can cover as much audio as the last forward pass took, which
+/// is longer than the endpoint threshold, so a single batch can hold one
+/// utterance ending and the next beginning.
 ///
-/// Running past the endpoint loses the second event silently: the onset is
+/// Running past an *endpoint* loses the second event silently: the onset is
 /// reported before the caller has built the pending utterance it should merge
 /// into, and because that onset reopens the detector no further onset is ever
 /// emitted, leaving the held utterance unreachable rather than merely late.
 ///
-/// Frames after the endpoint remain in the buffer and are scanned on the next
-/// iteration, by which time the caller has filed its pending utterance.
+/// Running past an *onset* starves the pipeline. The caller merges on an onset
+/// and then returns to the top of the loop on an endpoint, so a batch carrying
+/// both skips the buffer trim and the live inference pass entirely. Once a
+/// forward pass grows past the gap between utterances every batch carries both,
+/// and the trim then never runs: the buffer grows, inference slows, and each
+/// batch spans more audio still. Measured on a real recording, the loop stopped
+/// running live passes altogether and the buffer reached three times its
+/// configured bound.
+///
+/// Frames after the boundary remain in the buffer and are scanned on the next
+/// iteration, by which time the caller has acted on the one it was given.
 ///
 /// Silences are recorded in `dips` as they are found, and a run still growing
 /// updates the existing entry rather than adding a second one.
@@ -621,6 +683,7 @@ fn scan(
             VadEvent::Onset => {
                 *has_speech = true;
                 out.onset = true;
+                break;
             }
             VadEvent::Speaking => {
                 *has_speech = true;
@@ -714,18 +777,27 @@ fn resolve(
 ///
 /// A local count tracks the sentences this utterance filed and has not closed
 /// off, and is the only budget `discard` may spend from. Every branch that
-/// moves text keeps it honest: `delete` decrements it, `clear` and `rollback`
-/// zero it, and `copy` leaves it alone because copying moves no text.
+/// moves text keeps it honest: `delete` decrements it, and `clear`, `rollback`
+/// and `copy` zero it.
 ///
 /// Without that, an utterance combining a delete and a discard would remove a
 /// second sentence the utterance never filed.
+///
+/// `copy` used to leave the count alone, on the grounds that copying moves no
+/// text. It does now: the flush it runs is the one pass with no lag, so it may
+/// re-join a sentence this utterance filed into one that also holds older
+/// text, and a `discard` behind it would then take that older text too. Zeroing
+/// is right rather than merely safe — the flush finalizes what it reads, and
+/// nothing finalized is in flight.
 fn apply(
     script: &mut Transcript,
+    pass: Option<&mut Pass>,
     words: &[String],
     wake: &str,
     screen: &mut Renderer,
     why: &str,
 ) {
+    let mut pass = pass;
     let mut live = 0usize;
 
     for segment in command::split(words, wake) {
@@ -781,9 +853,249 @@ fn apply(
                 screen.notice(&msg);
             }
 
-            Segment::Run(Command::Copy) => screen.notice(&copy(script)),
+            // The one command whose whole purpose is the finished text, so it
+            // is the one command that waits for the cleanup pass. Copying the
+            // document as it stands hands over the seams the pass exists to
+            // remove, and it does so silently: the sentences look like
+            // sentences.
+            Segment::Run(Command::Copy) => {
+                let left = match pass.as_deref_mut() {
+                    Some(pass) => pass.flush(script, Instant::now() + COPY_FLUSH_BUDGET),
+                    None => 0,
+                };
+                live = 0;
+                screen.notice(&copy(script, left));
+            }
         }
     }
+}
+
+/// A batch out with the cleanup pass.
+///
+/// The words are kept, not just the range: the document moves under a spoken
+/// command while a batch is out, and splicing a reply into a range that no
+/// longer holds what was sent would overwrite whatever took its place.
+struct InFlight {
+    seq: u64,
+    range: std::ops::Range<usize>,
+    before: Vec<Vec<String>>,
+}
+
+/// The cleanup pass and the one batch it is allowed to have out.
+///
+/// The two belong together because every rule about the pass is a rule about
+/// the pair: only one batch is ever in flight, a reply is only ever applied to
+/// the batch that asked for it, and a batch still out has to be collected
+/// before another is sent. Kept apart, those are three things three call sites
+/// each have to remember.
+struct Pass {
+    tidy: cleanup::Cleanup,
+    out: Option<InFlight>,
+}
+
+impl Pass {
+    /// Applies a batch if one has come back. Never blocks.
+    ///
+    /// # Returns
+    ///
+    /// A message for the status line, only when the pass has gone away. A
+    /// reply that lands normally is silent: the speaker sees it as the gutter
+    /// mark clearing.
+    fn collect(&mut self, script: &mut Transcript) -> Option<String> {
+        match self.tidy.poll() {
+            cleanup::Progress::Waiting => None,
+            cleanup::Progress::Done(done) => {
+                // The slot is cleared on any reply, matching or not. A reply
+                // that does not match is one that is never coming, and leaving
+                // the slot filled would stop the pass for the rest of the
+                // session without stopping anything else, which is the hardest
+                // kind of quiet to notice.
+                match self.out.take() {
+                    Some(sent) if sent.seq == done.seq => {
+                        apply_cleanup(script, &sent.range, &sent.before, &done.text, Tail::Carry);
+                    }
+                    _ => trace::note("cleanup-lost", "a reply arrived for an unknown batch"),
+                }
+                None
+            }
+            // Usually a model that failed to load. Said once, because the
+            // alternative is a session that quietly stops repairing seams and
+            // looks exactly like one that never had any.
+            cleanup::Progress::Lost => {
+                self.out = None;
+                Some("cleanup pass has stopped — seams will stay as recognised".to_string())
+            }
+        }
+    }
+
+    /// Hands over the next batch if the pass is free to take one. Never blocks.
+    fn offer(&mut self, script: &Transcript, lag: usize, min: usize) {
+        if self.out.is_some() || !self.tidy.alive() || self.tidy.busy() {
+            return;
+        }
+        let most = ablate::tune("batch", cleanup::BATCH);
+        let Some(range) = script.cleanup_batch(lag, min, most) else {
+            return;
+        };
+        let run = &script.document()[range.clone()];
+        let before: Vec<Vec<String>> = run.iter().map(|s| s.words.clone()).collect();
+
+        // The batch is handed over with the recogniser's full stop taken off
+        // every line the trim cut. §11 calls this the one structural change
+        // worth the risk, and the reason is that defect 2 there is entirely a
+        // case of the pass being unable to infer from text what the host knows
+        // from the audio: `...and seems like the buffer.` followed by `It is
+        // still overflowing a little...` are two grammatical sentences, and
+        // nothing in them says the first one was severed.
+        //
+        // Invariant 3 is about transcript text reaching the *recognition*
+        // model. This pass is handed transcript text by construction, and what
+        // it gets here is less than before rather than more.
+        //
+        // The last line keeps its stop: there is nothing after it in this batch
+        // to join it to, and the carried tail gives it its chance next time.
+        let last = run.len().saturating_sub(1);
+        let text = run
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match s.cut && i != last && !ablate::off("seam-mark") {
+                true => text::unterminated(&s.text()),
+                false => s.text(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(seq) = self.tidy.submit(text) {
+            self.out = Some(InFlight { seq, range, before });
+        }
+    }
+
+    /// Runs the pass over everything settled and waits for it, up to `until`.
+    ///
+    /// The only place the main loop blocks on the cleanup pass, and it is
+    /// permitted at exactly two moments: the end of the session, and a spoken
+    /// `copy`. Both are points where the speaker has asked for the deliverable
+    /// and is by construction not talking — `copy` is parsed only from a
+    /// finalized utterance, so the endpoint has just fired and the buffer has
+    /// just been trimmed. Blocking anywhere else reproduces the loop
+    /// starvation of the decision record's §8.
+    ///
+    /// Whatever the pass has not reached when the budget runs out is finalized
+    /// where it stands. A run left settled is a run offered to the next pass,
+    /// and after this there may not be one.
+    ///
+    /// # Returns
+    ///
+    /// The number of sentences the budget did not cover.
+    fn flush(&mut self, script: &mut Transcript, until: Instant) -> usize {
+        // Collect what is already out **before** submitting anything. Replies
+        // come back in the order the batches went out, so submitting first
+        // pairs this batch's reply with the next batch's range, and every
+        // batch after it is shifted by one: the tail of the document, which is
+        // what this exists to repair, is spliced from the wrong run or refused
+        // outright.
+        if let Some(sent) = self.out.take() {
+            match self.tidy.wait(until.saturating_duration_since(Instant::now())) {
+                Some(done) if done.seq == sent.seq => {
+                    apply_cleanup(script, &sent.range, &sent.before, &done.text, Tail::Close);
+                }
+                // Still settled, so the loop below offers it again if there is
+                // budget left for it.
+                _ => trace::note("cleanup-lost", "the batch in flight never came back"),
+            }
+        }
+
+        while Instant::now() < until && self.tidy.alive() {
+            self.offer(script, 0, 1);
+            let Some(sent) = self.out.take() else { break };
+            match self.tidy.wait(until.saturating_duration_since(Instant::now())) {
+                Some(done) if done.seq == sent.seq => {
+                    apply_cleanup(script, &sent.range, &sent.before, &done.text, Tail::Close);
+                }
+                // Out of time, or a reply that is not this batch's. Either way
+                // nothing further arrives inside the budget.
+                _ => break,
+            }
+        }
+
+        let left = script.document().iter().filter(|s| s.tier == Tier::Settled).count();
+        script.finalize(0..script.document().len(), Vec::new(), Tail::Close);
+        left
+    }
+}
+
+/// Splices a finished cleanup batch into the document, if it is still safe to.
+///
+/// Three things stop it. The document may have moved under the batch while it
+/// was out, so the range no longer holds what was sent. The pass may have said
+/// nothing. Or [`cleanup::check`] may refuse it, for inventing a word the
+/// speaker did not say or for losing a stretch of what they did.
+///
+/// Every refusal still finalizes the run where it stands. A run left settled
+/// would be offered to the next pass, and the next, forever.
+fn apply_cleanup(
+    script: &mut Transcript,
+    range: &std::ops::Range<usize>,
+    before: &[Vec<String>],
+    reply: &str,
+    tail: Tail,
+) {
+    let intact = script.document().get(range.clone()).is_some_and(|now| {
+        now.len() == before.len() && now.iter().zip(before).all(|(s, w)| s.words == *w)
+    });
+    if !intact {
+        trace::note("cleanup-stale", "the document moved while the batch was out");
+        return;
+    }
+    // A refused reply still finalizes the run where it stands, so it takes the
+    // caller's tail policy too: during a session the last sentence is carried
+    // and gets a second reading with whatever follows it, and at a flush there
+    // is nothing following to wait for.
+
+    // One sentence per line is what the pass is asked for, so a line that comes
+    // back without a stop is one it forgot to punctuate rather than two
+    // sentences to be run together.
+    //
+    // Restoring it is what keeps the seam mark a hint. The batch was *sent*
+    // with the stop removed from every line the trim cut, and the reply is
+    // flattened to one string before it is re-split, so a pass that read the
+    // mark and declined to join would have had its reply read as a join anyway:
+    // the two lines would meet with no punctuation between them. Measured, that
+    // cost two sentence boundaries the recogniser had got right.
+    let text = reply
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .map(|line| match line.split_whitespace().next_back().is_some_and(text::ends_sentence) {
+            true => line,
+            false => format!("{line}."),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let after = text::words(&text);
+    let said: Vec<String> = before.iter().flatten().cloned().collect();
+
+    if after.is_empty() {
+        script.finalize(range.clone(), Vec::new(), tail);
+        return;
+    }
+    match cleanup::check(&said, &after) {
+        cleanup::Verdict::Accept => {}
+        verdict => {
+            trace::note("cleanup-refused", &format!("{verdict:?}: {text}"));
+            script.finalize(range.clone(), Vec::new(), tail);
+            return;
+        }
+    }
+
+    let sentences: Vec<Vec<String>> = text::split_sentences(&text)
+        .into_iter()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .collect();
+    trace::note(
+        "cleanup",
+        &format!("{} sentence(s) -> {}", before.len(), sentences.len()),
+    );
+    script.finalize(range.clone(), sentences, tail);
 }
 
 /// Copies the transcript to the clipboard.
@@ -796,20 +1108,21 @@ fn apply(
 /// # Returns
 ///
 /// A message for the status line, reporting success or failure.
-fn copy(script: &Transcript) -> String {
-    let text: Vec<String> = script
-        .document()
-        .iter()
-        .map(transcript::Sentence::text)
-        .collect();
-
-    if text.is_empty() {
+fn copy(script: &Transcript, unrefined: usize) -> String {
+    let document = script.document();
+    if document.is_empty() {
         return "copy — nothing to copy yet".to_string();
     }
 
-    let n = text.len();
-    match store::copy_to_clipboard(&(text.join("\n") + "\n")) {
-        Ok(()) => format!("copy — {n} sentence(s) on the clipboard"),
+    let n = document.len();
+    // Said when it happens, because the difference is invisible in the text:
+    // an unrepaired seam is a grammatical sentence that stops early.
+    let caveat = match unrefined {
+        0 => String::new(),
+        k => format!(" ({k} not refined — the cleanup pass ran out of time)"),
+    };
+    match store::copy_to_clipboard(&transcript::prose(document)) {
+        Ok(()) => format!("copy — {n} sentence(s) on the clipboard{caveat}"),
         Err(e) => format!("copy failed: {e}"),
     }
 }
@@ -824,8 +1137,16 @@ fn main() -> Result<()> {
         );
     }
 
+    // Before anything reads a guard, and loud on a misspelling: an ablation arm
+    // that silently does nothing produces two identical runs and the conclusion
+    // that the guard does not matter.
+    ablate::init().map_err(anyhow::Error::msg)?;
+
     install_signal_handlers();
     trace::init();
+    if let Some(off) = ablate::describe() {
+        trace::note("ablate", &off);
+    }
 
     let previous = store::newest_session();
 
@@ -863,6 +1184,20 @@ fn main() -> Result<()> {
         &command::hint(&args.assistant),
     )
     .context("starting inference sidecar")?;
+
+    // Started before capture so its model loads while the speaker is still
+    // finding the microphone. Nothing waits on it: a failure here costs the
+    // seam repairs, not the session.
+    let mut pass = match args.no_cleanup {
+        true => None,
+        false => match cleanup::Cleanup::start(&args.python, &args.cleanup_script, &args.cleanup_model) {
+            Ok(tidy) => Some(Pass { tidy, out: None }),
+            Err(e) => {
+                eprintln!("warning: no cleanup pass ({e:#}) — seams will stay as recognised");
+                None
+            }
+        },
+    };
 
     let capture = match &args.simulate {
         Some(path) => audio::simulate(path)?,
@@ -913,14 +1248,14 @@ fn main() -> Result<()> {
     let mut last_infer = Duration::ZERO;
     let trim_after = args.trim_after_s as usize * audio::TARGET_RATE as usize;
 
-    const TRIM_FLOOR_S: u64 = 10;
+    const TRIM_FLOOR_S: u64 = 6;
     if args.trim_after_s < TRIM_FLOOR_S {
         eprintln!(
-            "warning: --trim-after-s {} is below {TRIM_FLOOR_S}; the buffer will routinely pass \
-             {}s, past which the trim stops checking whether the text it severs has been filed \
-             and may split a sentence in two",
+            "warning: --trim-after-s {} is below {TRIM_FLOOR_S}; the trim keeps {}s of audio on \
+             each side of a cut, so below this there is barely a window left to hold out for a \
+             good pause in and almost every cut lands wherever it must",
             args.trim_after_s,
-            args.trim_after_s * FORCED_TRIM_MULTIPLE as u64,
+            MIN_SEGMENT_SAMPLES / audio::TARGET_RATE as usize,
         );
     }
 
@@ -943,6 +1278,22 @@ fn main() -> Result<()> {
 
         for msg in capture.notices.try_iter().chain(asr.notices().try_iter()) {
             screen.notice(&msg);
+        }
+        if let Some(pass) = &pass {
+            for msg in pass.tidy.notices().try_iter() {
+                screen.notice(&msg);
+            }
+        }
+
+        if let Some(pass) = &mut pass {
+            if let Some(msg) = pass.collect(&mut script) {
+                screen.notice(&msg);
+            }
+            pass.offer(
+                &script,
+                ablate::tune("lag", cleanup::LAG),
+                ablate::tune("min-batch", cleanup::MIN_BATCH),
+            );
         }
 
         let in_flight = match &pending {
@@ -990,8 +1341,13 @@ fn main() -> Result<()> {
 
         match capture.pcm.recv_timeout(Duration::from_millis(50)) {
             Ok(chunk) => {
+                let mut taken = chunk.len();
                 window.extend_from_slice(&chunk);
-                for chunk in capture.pcm.try_iter() {
+                while taken < MAX_INGEST_SAMPLES {
+                    let Ok(chunk) = capture.pcm.try_recv() else {
+                        break;
+                    };
+                    taken += chunk.len();
                     window.extend_from_slice(&chunk);
                 }
             }
@@ -1012,6 +1368,9 @@ fn main() -> Result<()> {
             let expired = pending.take().expect("just checked");
             file(&mut script, &expired.words, "settle");
             script.forget_filed();
+            // The hold ran out without a continuation, so the speaker stopped
+            // rather than drew breath. Whatever they say next opens a paragraph.
+            script.begin_paragraph();
             last_paint = long_ago;
         }
 
@@ -1093,7 +1452,14 @@ fn main() -> Result<()> {
                 }
 
                 if command::has_command(&utterance, &args.assistant) {
-                    apply(&mut script, &utterance, &args.assistant, &mut screen, "command");
+                    apply(
+                        &mut script,
+                        pass.as_mut(),
+                        &utterance,
+                        &args.assistant,
+                        &mut screen,
+                        "command",
+                    );
                     script.forget_filed();
                 } else if utterance.is_empty() || settle.window().is_zero() {
                     file(&mut script, &utterance, "endpoint");
@@ -1133,7 +1499,7 @@ fn main() -> Result<()> {
 
         let proposal = cut_point(&dips, window.len(), trim_after, script.filed_words()).or_else(
             || {
-                (window.len() >= trim_after.saturating_mul(FORCED_TRIM_MULTIPLE))
+                (window.len() >= trim_after.saturating_mul(LAST_RESORT_MULTIPLE))
                     .then(|| last_resort(&dips, &window))
                     .flatten()
             },
@@ -1164,7 +1530,7 @@ fn main() -> Result<()> {
                 ),
             );
 
-            let forced = window.len() >= trim_after.saturating_mul(FORCED_TRIM_MULTIPLE);
+            let forced = window.len() >= trim_after;
             let stranded = head.as_deref().map(|text| script.unfiled(text));
             let spent = head.as_deref().and_then(|text| script.spent_by(text));
 
@@ -1191,6 +1557,10 @@ fn main() -> Result<()> {
                     );
                     let k = head.as_deref().map_or(0, |t| script.filed_prefix_of(t));
                     script.forget_filed_prefix(k);
+                    // The audio stopped mid-sentence and the text was already
+                    // filed, so the sentence holding it now ends where the cut
+                    // did rather than where the speaker did.
+                    script.mark_cut();
                     true
                 }
 
@@ -1245,8 +1615,13 @@ fn main() -> Result<()> {
                         Ok(None) => {}
                         Err(e) => fatal = Some(e),
                     }
-                    apply(&mut script, &words, &args.assistant, &mut screen, "trim-forced");
+                    // No pass: this path is not a finalized utterance, so a
+                    // command parsed here is already outside invariant 5, and
+                    // letting a mis-heard `copy` block the loop mid-buffer
+                    // would make that worse rather than merely wrong.
+                    apply(&mut script, None, &words, &args.assistant, &mut screen, "trim-forced");
                     script.forget_filed_prefix(spent_here);
+                    script.mark_cut();
                     true
                 }
 
@@ -1312,12 +1687,10 @@ fn main() -> Result<()> {
             if commit > COMMIT_TARGET && !args.quiet && last_slowed.elapsed() >= NOTICE_EVERY {
                 last_slowed = Instant::now();
                 screen.notice(&format!(
-                    "text is settling {:.1}s behind \u{2014} {:.0}s buffer, {} ms per pass; \
-                     say \u{201c}{name}, keep\u{201d} to file what you have said and start fresh",
+                    "text is settling {:.1}s behind \u{2014} {:.0}s buffer, {} ms per pass",
                     commit.as_secs_f32(),
                     window.len() as f32 / audio::TARGET_RATE as f32,
                     hyp.infer_ms,
-                    name = args.assistant,
                 ));
             }
 
@@ -1348,6 +1721,23 @@ fn main() -> Result<()> {
         file(&mut script, &p.words, "eos-held");
     }
 
+    // The agreement window holds whatever the last live pass saw, which is not
+    // the same as what is still in the buffer: the source can run out while
+    // audio the detector has not reached is still queued, and the loop leaves
+    // by the shortest path when it does. Decoding the remainder here is what
+    // makes the tail independent of where the last tick happened to land.
+    if fatal.is_none() && has_speech && window.len() > PREROLL_SAMPLES {
+        match asr.transcribe(&window) {
+            Ok(sidecar::Reply::Hypothesis(hyp)) => {
+                script.push_hypothesis(&hyp.text);
+            }
+            Ok(sidecar::Reply::Failed(why)) => {
+                screen.notice(&format!("sidecar failed on the final buffer: {why}"));
+            }
+            Err(e) => fatal = Some(e),
+        }
+    }
+
     let mut tail = script.finalize_window();
     if fatal.is_none()
         && let Ok(Some(hinted)) =
@@ -1355,7 +1745,26 @@ fn main() -> Result<()> {
     {
         tail = hinted;
     }
-    apply(&mut script, &tail, &args.assistant, &mut screen, "eos");
+    // No pass: the exit flush runs a few lines below and covers everything
+    // this files, so a `copy` here would only pay for the same work twice.
+    apply(&mut script, None, &tail, &args.assistant, &mut screen, "eos");
+
+    // The last few sentences are still settled: the pass runs a few behind so a
+    // spoken command can reach them, and nothing is going to be spoken now.
+    // This is the one place the cleanup pass is waited on, because the cost
+    // lands on the speaker's exit rather than on their latency.
+    if let Some(pass) = &mut pass {
+        let left = pass.flush(&mut script, Instant::now() + EXIT_FLUSH_BUDGET);
+        if left > 0 {
+            eprintln!(
+                "warning: {left} sentence(s) exited unrefined — the cleanup pass ran out of time"
+            );
+        }
+    }
+
+    if let Some(pass) = pass {
+        pass.tidy.finish();
+    }
 
     if let Some(store) = &mut store {
         store.save(script.document(), script.revision(), "");
@@ -1764,8 +2173,30 @@ mod tests {
         out
     }
 
+    /// Drives `scan` to exhaustion, returning the boundary events in order.
+    ///
+    /// One call reports at most one boundary, so a test that wants to know what
+    /// a stretch of audio contains has to keep asking.
+    fn boundaries(vad: &mut Vad, window: &[f32]) -> Vec<Scan> {
+        let mut cursor = 0usize;
+        let mut dips = Vec::new();
+        let mut has_speech = false;
+        let mut seen = Vec::new();
+
+        loop {
+            let before = cursor;
+            let out = scan(vad, window, &mut cursor, &mut dips, &mut has_speech);
+            if out != Scan::default() {
+                seen.push(out);
+            }
+            if cursor == before || cursor + FRAME > window.len() {
+                return seen;
+            }
+        }
+    }
+
     /// One batch can hold an utterance ending and the next beginning, since the
-    /// loop drains the whole backlog. Running past the endpoint reports an onset
+    /// loop drains the backlog. Running past the endpoint reports an onset
     /// before the caller has a pending utterance to merge it into, and leaves the
     /// detector active so no further onset ever arrives. Stopping at the endpoint
     /// puts the two events in separate iterations.
@@ -1778,29 +2209,56 @@ mod tests {
         window.extend(tone(60, 0.0, &mut phase));
         window.extend(tone(60, 0.3, &mut phase));
 
+        let seen = boundaries(&mut vad, &window);
+
+        assert_eq!(
+            seen,
+            vec![
+                Scan { onset: true, endpointed: false },
+                Scan { onset: false, endpointed: true },
+                Scan { onset: true, endpointed: false },
+            ],
+            "each boundary has to arrive on its own iteration, in order"
+        );
+    }
+
+    /// The starvation fix, stated as the thing that must not happen.
+    ///
+    /// A batch spanning an onset and the endpoint that follows it must not
+    /// report both. The caller merges on the onset and then returns to the top
+    /// of the loop on the endpoint, so reporting both in one call skips the
+    /// buffer trim and the live inference pass. That is self-reinforcing: the
+    /// buffer grows, the next pass is slower, and the batch after it spans more
+    /// audio still.
+    #[test]
+    fn one_batch_never_reports_an_onset_and_its_endpoint_together() {
+        let mut vad = Vad::new(150, 600, vad::DEFAULT_FLOOR_DBFS);
+        let mut phase = 0usize;
+
+        let mut window = tone(60, 0.3, &mut phase);
+        window.extend(tone(60, 0.0, &mut phase));
+
         let mut cursor = 0usize;
         let mut dips = Vec::new();
         let mut has_speech = false;
 
         let first = scan(&mut vad, &window, &mut cursor, &mut dips, &mut has_speech);
-        assert!(first.endpointed, "the pause has to end the utterance");
+        assert!(first.onset, "the onset is what this batch opens with");
         assert!(
-            cursor < window.len(),
-            "the scan must leave the resumption for the next iteration, \
-             not consume it before the caller can hold anything"
+            !first.endpointed,
+            "and the endpoint behind it has to wait for the next iteration, \
+             or the trim and the live pass are both skipped"
         );
+        assert!(cursor < window.len(), "the rest stays for the next iteration");
 
-        has_speech = false;
-        let resumed = scan(&mut vad, &window, &mut cursor, &mut dips, &mut has_speech);
-        assert!(resumed.onset, "the resumption must still be reported");
-        assert!(!resumed.endpointed, "and must not be mistaken for another end");
-        assert!(has_speech);
+        let second = scan(&mut vad, &window, &mut cursor, &mut dips, &mut has_speech);
+        assert!(second.endpointed, "and it must still arrive");
     }
 
-    /// The ordinary case has to keep working: no endpoint means the scan
-    /// consumes every whole frame it was given.
+    /// The ordinary case has to keep working: past the onset, a stretch with no
+    /// boundary in it is consumed whole.
     #[test]
-    fn a_scan_without_an_endpoint_consumes_the_whole_buffer() {
+    fn a_scan_without_a_boundary_consumes_the_whole_buffer() {
         let mut vad = Vad::new(150, 600, vad::DEFAULT_FLOOR_DBFS);
         let mut phase = 0usize;
         let window = tone(40, 0.3, &mut phase);
@@ -1810,7 +2268,10 @@ mod tests {
         let mut has_speech = false;
 
         let out = scan(&mut vad, &window, &mut cursor, &mut dips, &mut has_speech);
-        assert!(out.onset && !out.endpointed);
+        assert!(out.onset && !out.endpointed, "the onset stops the first call");
+
+        let rest = scan(&mut vad, &window, &mut cursor, &mut dips, &mut has_speech);
+        assert_eq!(rest, Scan::default(), "nothing further happens in this audio");
         assert_eq!(cursor, window.len(), "nothing may be left behind");
     }
 
@@ -1820,7 +2281,7 @@ mod tests {
     /// the same path a piped session takes, so nothing is stubbed out.
     fn say(script: &mut Transcript, utterance: &str) {
         let mut screen = Renderer::new();
-        apply(script, &words(utterance), "Luna", &mut screen, "test");
+        apply(script, None, &words(utterance), "Luna", &mut screen, "test");
     }
 
     /// Both verbs take one sentence. What differs is how far back each reaches,
