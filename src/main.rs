@@ -13,6 +13,7 @@ mod cleanup;
 mod command;
 mod render;
 mod repair;
+mod runtime;
 mod sidecar;
 mod store;
 mod text;
@@ -33,6 +34,7 @@ use vad::{FRAME, Vad, VadEvent};
 #[derive(Parser)]
 #[command(
     about = "Local real-time speech-to-text with live provisional text",
+    version,
     allow_negative_numbers = true
 )]
 /// Command-line configuration.
@@ -173,9 +175,9 @@ struct Args {
     #[arg(long, default_value = "mlx-community/Qwen3-4B-4bit")]
     cleanup_model: String,
 
-    /// Cleanup sidecar script.
-    #[arg(long, default_value = "sidecar/cleanup_sidecar.py")]
-    cleanup_script: PathBuf,
+    /// Cleanup sidecar script, overriding the copy carried by the binary.
+    #[arg(long)]
+    cleanup_script: Option<PathBuf>,
 
     /// Leave settled sentences exactly as the recogniser filed them.
     ///
@@ -185,13 +187,17 @@ struct Args {
     #[arg(long)]
     no_cleanup: bool,
 
-    /// Python interpreter for the sidecar.
-    #[arg(long, default_value = ".venv/bin/python")]
-    python: PathBuf,
+    /// Python interpreter for the sidecars.
+    ///
+    /// Omit it and one is found: `STT_PYTHON`, then `.venv/bin/python`, then the
+    /// managed environment under `~/.cache/speech-to-text-cli`, which is built
+    /// with `uv` on first use.
+    #[arg(long)]
+    python: Option<PathBuf>,
 
-    /// Sidecar script.
-    #[arg(long, default_value = "sidecar/asr_sidecar.py")]
-    script: PathBuf,
+    /// Recognition sidecar script, overriding the copy carried by the binary.
+    #[arg(long)]
+    script: Option<PathBuf>,
 }
 
 /// Silence retained ahead of speech onset, in samples, so the first phoneme is
@@ -1176,9 +1182,19 @@ fn main() -> Result<()> {
         );
     }
 
+    // Before either sidecar starts, and the one step that may take tens of
+    // seconds and print while doing it: on a fresh machine this builds the
+    // Python environment both of them run in.
+    let py = runtime::resolve(
+        args.python.as_deref(),
+        args.script.as_deref(),
+        args.cleanup_script.as_deref(),
+    )
+    .context("locating the Python side of the pipeline")?;
+
     let mut asr = sidecar::Sidecar::spawn(
-        &args.python,
-        &args.script,
+        &py.python,
+        &py.asr,
         &args.model,
         args.language.as_deref(),
         &command::hint(&args.assistant),
@@ -1190,7 +1206,7 @@ fn main() -> Result<()> {
     // seam repairs, not the session.
     let mut pass = match args.no_cleanup {
         true => None,
-        false => match cleanup::Cleanup::start(&args.python, &args.cleanup_script, &args.cleanup_model) {
+        false => match cleanup::Cleanup::start(&py.python, &py.cleanup, &args.cleanup_model) {
             Ok(tidy) => Some(Pass { tidy, out: None }),
             Err(e) => {
                 eprintln!("warning: no cleanup pass ({e:#}) — seams will stay as recognised");

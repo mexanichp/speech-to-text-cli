@@ -9,13 +9,17 @@ Dictation with live provisional text, built on [Qwen3-ASR-1.7B](https://huggingf
 
 ## Setup
 
-Apple Silicon, Rust, Python 3.10+. Two models download on first run, ~1.8 GB and ~2.3 GB.
+```sh
+brew install mexanichp/tap/speech-to-text-cli
+```
+
+Or build it: Apple Silicon, Rust, and [uv](https://github.com/astral-sh/uv).
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install "mlx-audio[stt]"
 cargo build --release
 ```
+
+First run builds the Python environment in `~/.cache/speech-to-text-cli` and downloads two models, ~1.8 GB and ~2.3 GB.
 
 ## Usage
 
@@ -80,7 +84,10 @@ The comma is optional. `Luna deletes` is the same command. Nothing may come betw
 | `--cleanup-model` | `Qwen3-4B-4bit` | text model that repairs sentence boundaries |
 | `--no-cleanup` | off | leave the transcript exactly as recognised |
 
-`STT_TRACE=<file>` logs every sentence filed, every buffer trim and every cleanup pass.
+| variable | effect |
+|---|---|
+| `STT_TRACE=<file>` | log every sentence filed, every buffer trim and every cleanup pass |
+| `STT_PYTHON=<path>` | interpreter for the sidecars, instead of the managed one |
 
 ## Decision record
 

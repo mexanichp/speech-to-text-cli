@@ -1,0 +1,87 @@
+name: release
+
+# Apple Silicon only, so there is no build matrix: one artifact, one runner.
+# macos-15 is arm64, and is free for public repositories.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      # CLAUDE.md: `cargo test` is the gate. A tag that cannot pass it is not a
+      # release. Nothing here needs a microphone or a model.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="$(git rev-parse --short HEAD)"
+          name="speech-to-text-cli-${version}-aarch64-apple-darwin"
+
+          mkdir -p "dist/$name"
+          # Not stripped: arm64 binaries carry a mandatory ad-hoc signature that
+          # the linker applies, and stripping invalidates it.
+          cp target/release/speech-to-text-cli "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+          sha="$(shasum -a 256 "dist/$name.tar.gz" | cut -d' ' -f1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      # The formula lives in a separate tap repository, so the release cannot
+      # update it. It prints what to paste instead, with the checksum already
+      # filled in, because a hand-copied sha256 is the step that goes wrong.
+      - name: Formula
+        run: |
+          {
+            echo '## Homebrew'
+            echo
+            echo 'Update `Formula/speech-to-text-cli.rb` in `mexanichp/homebrew-tap`:'
+            echo
+            echo '```ruby'
+            echo '  url "https://github.com/${{ github.repository }}/releases/download/v${{ steps.package.outputs.version }}/speech-to-text-cli-${{ steps.package.outputs.version }}-aarch64-apple-darwin.tar.gz"'
+            echo '  sha256 "${{ steps.package.outputs.sha256 }}"'
+            echo '  version "${{ steps.package.outputs.version }}"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speech-to-text-cli-aarch64-apple-darwin
+          path: ${{ steps.package.outputs.tarball }}
+
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${{ steps.package.outputs.tarball }}"

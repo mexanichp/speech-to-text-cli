@@ -55,6 +55,7 @@ The deliverable is the third tier.
 | D14 | **Three tiers, and the tier is visible** | The cleanup pass moves plain text, so a two-tier screen would be lying |
 | D15 | **Cleanup batches overlap by one sentence** | A seam landing on a batch boundary is otherwise unjoinable: one half finalizes before the other is read |
 | D16 | **The pass is told which full stops the trim invented**, by sending those lines without one | The host knows from the audio what the pass cannot infer from the text |
+| D17 | **The binary carries its sidecars and finds its own interpreter** | An installed binary has no repository below it. Relative paths were the only thing tying this one to a working directory |
 
 ### D1: why Qwen3-ASR
 
@@ -195,6 +196,39 @@ might still change the words when it will not, or leave it unmarked, claiming it
 is finished when it is not. The tier goes in the gutter, which already exists to
 say which layer a row belongs to.
 
+### D17: the binary is the unit of distribution
+
+Three things tied a build to the directory it was built in: `--python` defaulted
+to `.venv/bin/python`, and the two scripts defaulted to `sidecar/*.py`. All three
+are relative, so an installed binary worked only when the working directory
+happened to be a checkout. That is the whole of what made this undistributable;
+the channel was never the problem.
+
+The scripts are `include_str!`d and written to `~/.cache/speech-to-text-cli` on
+startup, rewritten only when the content differs. So a binary upgrade replaces
+them, an edit during development replaces them, and neither needs a version to
+compare. `cargo install` starts working as a side effect, since the scripts stop
+being data files that cargo would have to place.
+
+The interpreter is resolved rather than assumed: `--python`, then `STT_PYTHON`,
+then `.venv/bin/python`, then a managed environment built with `uv` from the
+pinned `requirements.txt`. **The `.venv` rule is load-bearing for this
+repository**, not a courtesy: it keeps every measurement in §8 and §11
+reproducible against the interpreter they were taken with, while a fresh machine
+gets the managed one. The managed environment records the pin it was built from,
+and a bootstrap that dies halfway leaves no record and is retried rather than
+trusted.
+
+`uv` at first run rather than Homebrew `resource` stanzas. Homebrew installs
+resources from sdists, and numpy, scipy and tokenizers would each be compiled;
+every pin here has an arm64 wheel, so the bootstrap is a download measured in
+tens of seconds against the several gigabytes of weights that follow it
+immediately. The formula therefore installs one binary and depends on `uv`.
+
+Pinning the whole set rather than the two direct dependencies is deliberate. A
+floating transitive dependency moves the numbers in §8 silently, and this file
+has already recorded what an unnoticed change to the reference costs.
+
 ---
 
 ## 3. Architecture
@@ -257,6 +291,8 @@ src/store.rs       session autosave, resume, clipboard
 src/trace.rs       filing-path trace, off unless STT_TRACE names a file
 src/ablate.rs      switches one guard off for a measurement, via STT_ABLATE
 src/render.rs      alternate-screen live document, wrap-safe row layout
+src/runtime.rs     the Python side: embedded sidecar scripts, the interpreter
+                   resolution order, the uv bootstrap
 src/sidecar.rs     subprocess handle + NDJSON protocol
 sidecar/asr_sidecar.py       MLX inference; stdout is protocol, stderr is logs
 sidecar/cleanup_sidecar.py   mlx-lm text repair; same protocol discipline
@@ -1322,6 +1358,26 @@ boundary and WER numbers come from. It is one speaker on one topic.
   over them again.
 - **The session file is one sentence per line and carries no tier**, so a
   resumed session cannot tell what had already been cleaned.
+
+### Distribution
+
+- **The bootstrap path is not covered by `cargo test`.** The tests reach the
+  resolution order and the pin stamp; building the environment needs `uv`, an
+  interpreter download and forty wheels, so it is exercised by running it on a
+  machine that has none of them and nowhere else. What is tested is that a
+  binary with no repository below its working directory starts both sidecars.
+- **The formula's `sha256` is updated by hand.** The release workflow prints the
+  three lines to paste, because the formula lives in a separate tap repository
+  that the release cannot write to. A stale checksum fails the install loudly,
+  which is the right direction to fail in.
+- **A release tarball is only supported through the tap.** Homebrew fetches with
+  curl, which does not set the quarantine attribute, so the binary runs
+  unsigned. The same tarball downloaded in a browser is quarantined and will
+  refuse to open. Notarising it is the fix and has not been done.
+- **`PYTHON_VERSION` is a single point of evidence.** Every pin in
+  `requirements.txt` is known to have an arm64 wheel there because the
+  development environment has them installed. Moving it invalidates that, and
+  the failure is a slow source build rather than an error.
 
 ### Deliberately not gaps
 
