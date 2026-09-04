@@ -455,6 +455,18 @@ needs a habit and a one-off interruption washes out. It never reads the text,
 only the speaker's pause habit. A zero floor switches adaptation off, since that
 is an explicit instruction not to hold.
 
+**Two silences are not evidence and never reach it.** One is longer than the
+ceiling: that is an absence rather than a pause, and the clamp that bounds the
+growth step is what used to make the two indistinguishable. The other followed a
+spoken command, whose audio invariant 5 drops, so nothing was left to continue
+and the silence says nothing about how long to hold for a continuation. Both
+were measured; see §8.
+
+The hold is timed from the endpoint, not from the end of the whole-utterance
+decodes behind it, so what it measures is the speaker's silence rather than the
+pipeline's work. `settle-hold` in the trace says when the hold moved and what
+taught it, because the countdown shows only what the hold is now.
+
 Consequence: every ordinary pause merges, so a session merges continuously and
 the buffer never resets on its own. That is what makes the trim load-bearing.
 
@@ -629,7 +641,9 @@ Break one of these and the failure is usually silent.
    
 5. **Commands are parsed from finalized utterances only**, and the audio that
    carried one is dropped, never retained for continuation. Retention is the
-   only thing that could replay a command.
+   only thing that could replay a command. The silence after one is not fed to
+   the settle either, for the same reason: nothing was kept that could be
+   continued.
 6. **`scan()` reports at most one boundary and stops there.** One loop
    iteration can cover more audio than the endpoint threshold, so a single batch
    can hold one utterance ending and the next beginning. Running past an
@@ -771,6 +785,44 @@ ordered checklist does not.
 **A batch of one sentence is useless.** The pass exists to join sentences split
 across a seam, and handed them one at a time it can only re-punctuate each in
 isolation. `MIN_BATCH` is why, and it was found by wiring it up without one.
+
+### The settle ratcheted on the speaker stopping
+
+The hold grew every time the speaker stopped and came back, and the commonest
+way to make them stop is to hand them their text: after `copy` they are pasting
+it, after `clear` they are starting over. Two mechanisms, both in `resumed`.
+
+**The clamp decided whether a silence was evidence, not just how much.**
+`gap.min(window)` was there to bound the growth step. Growth is maximal, exactly
+the margin, when `gap >= window`; and `gap >= window` is the condition under
+which the hold had already expired, filed the text and begun a paragraph. So the
+full step was only ever paid on the silences that proved the hold was long
+enough, and twenty seconds away taught the same thing as ten minutes away.
+
+**A command endpoint armed the learner like any other.** It creates no held
+utterance at all, so the silence that followed could not have been a
+continuation of anything.
+
+Measured on synthesized speech, four identical 6.2 s silences against a 3 s
+floor: the hold went 3.00 to 4.50 to 6.75 to 8.45 s, and by the fourth the same
+silence merged instead of filing, so the speaker got two paragraphs where they
+had made four. At the shipped defaults a 44.7 s absence took the hold to the
+ceiling; it now decays instead, 29.67 to 29.44 s.
+
+Recovery was the other half of it. The decay is per resumption, not per second,
+so undoing one step took 51.7 resumptions and the ceiling took 88.4. At the
+resumption rate of recording 1 that is minutes of unbroken speech per step,
+against one step per stop.
+
+**Two plausible causes that were not it**, both checked before the fix. The
+`copy` flush does block the loop, but it runs before the endpoint is stamped, so
+it shortens the measured silence rather than lengthening it: 5.63 s against
+5.01 s on the same 6.29 s of real silence. And the two whole-utterance decodes
+at an endpoint do delay the hold clock, by 0.18 to 0.68 s, median 0.42 s over 22
+endpoints on recording 1. Real, worth removing, and far too small to be this.
+
+None of the recordings could have caught this. Every pause in them merges, and
+none of them contains a spoken command, so the whole session runs at the floor.
 
 ### The loop starvation
 
@@ -1331,8 +1383,14 @@ boundary and WER numbers come from. It is one speaker on one topic.
 - **The first pause past the settle floor is always lost.** A pause is only
   measurable once it has ended, so a speaker whose habit exceeds the floor pays
   one fragment before `Settle` adapts.
-- **`Settle` learns from silence, not from meaning.** A speaker who stops
-  mid-topic and one who has finished are indistinguishable to it.
+- **`Settle` learns from silence, not from meaning**, so a stop is still read as
+  a pause that was too short. A silence between the floor and the ceiling
+  teaches the hold a step even where the hold expired through it, filed the text
+  and began a paragraph, which is exactly the case where the speaker had
+  finished. Two such stops still walk the shipped hold from the floor to the
+  ceiling. §8 took the absence and the command out of the evidence; this is the
+  residue, and closing it needs a signal neither the audio nor the text
+  supplies.
 - **Paragraphs come only from an expired hold.** A speaker who never pauses for
   the full settle gets one paragraph, however long the session.
 - **Arbitrary substitutions are undetectable.** `Tuesday`/`Wednesday` shares no

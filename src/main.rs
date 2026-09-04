@@ -133,8 +133,9 @@ struct Args {
     ///
     /// It is also how long a silence still counts as a continuation, and a
     /// continuation splices the previous utterance's audio back into the buffer
-    /// instead of letting it reset. Set equal to `--continue-ms` to pin the
-    /// hold and disable adaptation.
+    /// instead of letting it reset. A silence longer than this is an absence
+    /// rather than a pause and teaches the hold nothing. Set equal to
+    /// `--continue-ms` to pin the hold and disable adaptation.
     #[arg(long, default_value_t = 30_000)]
     continue_max_ms: u64,
 
@@ -370,6 +371,11 @@ const PAUSE_MARGIN_DIVISOR: u32 = 2;
 /// expired. Learning only from pauses short enough to have been merged would be
 /// blind to the only kind that damages a transcript.
 ///
+/// Two silences are not resumptions and never reach it. One is longer than the
+/// ceiling, and is an absence rather than a pause; see [`Settle::resumed`]. The
+/// other followed a spoken command, whose audio is dropped and can therefore
+/// never be continued; see invariant 5.
+///
 /// # Bias
 ///
 /// Holding too long leaves text dim for longer and is recoverable, since
@@ -416,9 +422,23 @@ impl Settle {
     /// This also bounds the buffer, since the hold decides how long a silence
     /// still counts as a continuation and a continuation splices the previous
     /// utterance's audio back in rather than letting it reset.
+    ///
+    /// # An absence is not a pause
+    ///
+    /// The clamp below bounds how fast the hold may grow. It must not also
+    /// decide *whether* the silence is evidence, because clamping reads every
+    /// absence as a pause at the top of the range: away for twenty seconds and
+    /// away for ten minutes teach the same thing, and the hold ratchets on the
+    /// speaker leaving rather than on their pause habit. The ceiling is the
+    /// operator's own statement of the longest silence worth holding for, so a
+    /// silence past it is not a pause and teaches nothing.
     fn resumed(&mut self, gap: Duration) {
         let faded = self.observed.saturating_mul(PAUSE_DECAY_NUM) / PAUSE_DECAY_DEN;
-        self.observed = faded.max(gap.min(self.window()));
+        let evidence = match gap > self.ceiling {
+            true => Duration::ZERO,
+            false => gap.min(self.window()),
+        };
+        self.observed = faded.max(evidence);
     }
 
     /// The current hold duration, clamped between the floor and the ceiling.
@@ -1374,10 +1394,6 @@ fn main() -> Result<()> {
         let Scan { onset, endpointed } =
             scan(&mut vad, &window, &mut vad_cursor, &mut dips, &mut has_speech);
 
-        if onset && let Some(ended) = last_endpoint.take() {
-            settle.resumed(ended.elapsed());
-        }
-
         if let Some(p) = &pending
             && p.at.elapsed() >= settle.window()
         {
@@ -1429,6 +1445,32 @@ fn main() -> Result<()> {
             gap_samples = 0;
         }
 
+        // After the two decisions it bears on, never before them. Run first, it
+        // grows the hold by the margin and then judges this very pause against
+        // the grown one, so a pause up to a step longer than the countdown said
+        // still merges and the number on screen is not the deadline.
+        if onset && let Some(ended) = last_endpoint.take() {
+            let gap = ended.elapsed();
+            let was = settle.window();
+            settle.resumed(gap);
+            // Only when it moves, so an ordinary session stays quiet. The hold
+            // is state the speaker cannot see the history of: the countdown
+            // shows what it is now, never that it changed or what taught it,
+            // and a hold that grew for a bad reason looks exactly like one that
+            // grew for a good one.
+            if settle.window() != was {
+                trace::note(
+                    "settle-hold",
+                    &format!(
+                        "a {:.2}s silence moved the hold {:.2}s -> {:.2}s",
+                        gap.as_secs_f32(),
+                        was.as_secs_f32(),
+                        settle.window().as_secs_f32(),
+                    ),
+                );
+            }
+        }
+
         if !has_speech && window.len() > PREROLL_SAMPLES {
             let drop = window.len() - PREROLL_SAMPLES;
             window.drain(..drop);
@@ -1439,12 +1481,21 @@ fn main() -> Result<()> {
         }
 
         if endpointed {
+            // Stamped before the two whole-utterance decodes below, because
+            // both the hold and the silence it is measured against belong to
+            // the speaker rather than to the pipeline. Taking the time after
+            // them adds a term that grows with utterance length to the wait,
+            // and makes how much silence counts as a continuation depend on how
+            // long the previous utterance took to decode.
+            let ep_at = Instant::now();
             let ended = {
                 let after = window.split_off(vad_cursor.min(window.len()));
                 std::mem::replace(&mut window, after)
             };
             vad_cursor = 0;
             dips.retain(|d| d.at < ended.len());
+
+            let mut commanded = false;
 
             if has_speech {
                 match asr.transcribe(&ended) {
@@ -1477,6 +1528,7 @@ fn main() -> Result<()> {
                         "command",
                     );
                     script.forget_filed();
+                    commanded = true;
                 } else if utterance.is_empty() || settle.window().is_zero() {
                     file(&mut script, &utterance, "endpoint");
                     script.forget_filed();
@@ -1495,14 +1547,20 @@ fn main() -> Result<()> {
                         audio: ended,
                         dips: std::mem::take(&mut dips),
                         words: held,
-                        at: Instant::now(),
+                        at: ep_at,
                     });
                     gap_samples = 0;
                 }
             }
             dips.clear();
             has_speech = false;
-            last_endpoint = Some(Instant::now());
+            // A command arms nothing. Invariant 5 drops the audio that carried
+            // one, so the silence after it cannot be a continuation, and a
+            // silence that cannot be a continuation says nothing about how long
+            // to hold for one. The commands that produce the longest silences
+            // are the ones that hand the speaker their text: after `copy` they
+            // are pasting it, after `clear` they are starting over.
+            last_endpoint = (!commanded).then_some(ep_at);
             last_tick = Instant::now();
             tick = interval;
             probe_debt = Duration::ZERO;
@@ -1878,12 +1936,17 @@ mod tests {
     }
 
     /// It still has to fade, or one interruption pins the settle open for the
-    /// session. Gradually, though — there must be no pause at which behaviour
+    /// session. Gradually, though: there must be no pause at which behaviour
     /// changes abruptly.
     #[test]
     fn a_one_off_interruption_washes_out_gradually() {
         let mut s = settle();
-        s.resumed(secs(300));
+        s.resumed(secs(50));
+        assert!(
+            s.window() > s.floor,
+            "an interruption inside the ceiling still teaches: {:?}",
+            s.window()
+        );
         assert!(
             s.window() < s.ceiling,
             "one interruption must not reach the ceiling: {:?}",
@@ -1905,22 +1968,48 @@ mod tests {
         assert!(worst <= secs(2), "decay must be gradual, worst step was {worst:?}");
     }
 
-    /// A single absence must move the hold one step rather than teaching the
+    /// A single long pause must move the hold one step rather than teaching the
     /// ceiling outright, which made the hold jump with nothing on screen to
     /// explain it and take dozens of ordinary pauses to come back.
     #[test]
-    fn a_single_long_absence_moves_the_hold_one_step_not_to_the_ceiling() {
+    fn a_single_long_pause_moves_the_hold_one_step_not_to_the_ceiling() {
         let mut s = settle();
         let before = s.window();
-        s.resumed(secs(600));
+        s.resumed(secs(50));
         let after = s.window();
 
         assert!(after > before, "it must still learn something");
         assert!(
             after < s.ceiling,
-            "one absence must not reach the ceiling: {after:?}"
+            "one pause must not reach the ceiling: {after:?}"
         );
         assert_eq!(after, before * PAUSE_MARGIN / PAUSE_MARGIN_DIVISOR);
+    }
+
+    /// The reported failure. Clamping the gap to the window before observing it
+    /// bounded the step, and in doing so made every absence indistinguishable
+    /// from a pause at the top of the range: away for a minute and away for ten
+    /// taught the same thing, so the hold ratcheted a full step every time the
+    /// speaker stopped and came back. Two stops reached the shipped ceiling and
+    /// undoing one took about fifty ordinary pauses.
+    #[test]
+    fn an_absence_past_the_ceiling_is_not_a_pause() {
+        let mut s = settle();
+        s.resumed(secs(600));
+        assert_eq!(s.window(), s.floor, "leaving the room teaches nothing");
+    }
+
+    /// The shape of the failure rather than one step of it: the speaker stops
+    /// for longer than the hold, comes back, and does it again. Every one of
+    /// those silences is one the hold already expired through, which is the
+    /// evidence that it was long enough.
+    #[test]
+    fn stopping_and_coming_back_does_not_ratchet_the_hold() {
+        let mut s = Settle::new(15_000, 30_000);
+        for _ in 0..6 {
+            s.resumed(secs(90));
+            assert_eq!(s.window(), s.floor, "an absence must not teach: {:?}", s.window());
+        }
     }
 
     /// A habit still reaches the ceiling, because the pause happens again at
