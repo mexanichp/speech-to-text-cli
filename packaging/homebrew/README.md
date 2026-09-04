@@ -25,9 +25,12 @@ Install.
 brew install mexanichp/tap/speech-to-text-cli
 ```
 
-Check the formula before pushing it.
+Check the formula. These read the tap's local clone under
+`$(brew --repository)/Library/Taps`, not the remote, so pull it first or they
+audit the version you just replaced.
 
 ```sh
+git -C "$(brew --repository)/Library/Taps/mexanichp/homebrew-tap" pull --ff-only
 brew audit --strict --online mexanichp/tap/speech-to-text-cli
 brew install --build-from-source mexanichp/tap/speech-to-text-cli
 brew test mexanichp/tap/speech-to-text-cli

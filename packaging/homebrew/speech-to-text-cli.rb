@@ -5,8 +5,8 @@ class SpeechToTextCli < Formula
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
 
-  depends_on :macos
   depends_on arch: :arm64
+  depends_on :macos
 
   # Builds the pinned Python environment the two sidecars run in, on first use.
   # Not a set of `resource` stanzas: that would have Homebrew build numpy, scipy
