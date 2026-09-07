@@ -6,7 +6,7 @@
 ![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-EE5340?labelColor=4AC9E3)
 ![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-4AC9E3?labelColor=EE5340)
 
-Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B), which is selected for accuracy on accented and non-native English, and re-punctuates the settled sentences with a second local model. All inference runs on the local machine.
+Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit), which is selected for accuracy on accented and non-native English, and re-punctuates the settled sentences with [Qwen3-4B](https://huggingface.co/mlx-community/Qwen3-4B-4bit). All inference runs on the local machine.
 
 ## Setup
 
@@ -81,8 +81,8 @@ The comma is optional, and `Luna deletes` is the same command. Don't put anythin
 | `--persist` | Off | Keeps the session file when you exit |
 | `--resume [PATH]` | Off | Continues a previous session |
 | `--quiet` | Off | Suppresses the settling-behind notice |
-| `--model` | `Qwen3-ASR-1.7B-8bit` | Selects any MLX Qwen3-ASR repository |
-| `--cleanup-model` | `Qwen3-4B-4bit` | Selects the text model that repairs sentence boundaries |
+| `--model` | `mlx-community/Qwen3-ASR-1.7B-8bit` | Selects any MLX Qwen3-ASR repository |
+| `--cleanup-model` | `mlx-community/Qwen3-4B-4bit` | Selects the text model that repairs sentence boundaries |
 | `--no-cleanup` | Off | Leaves the transcript exactly as recognized |
 
 | Variable | Effect |
