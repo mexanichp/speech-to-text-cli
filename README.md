@@ -1,12 +1,12 @@
 # speech-to-text-cli
 🦀 Local real-time speech-to-text for Apple Silicon
 
-[![CI/CD status](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd&labelColor=F0EEE9)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
-[![Latest version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=133955&labelColor=F0EEE9)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
-![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-D29380?labelColor=F0EEE9)
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-646049?labelColor=F0EEE9)
+[![CI/CD status](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd&labelColor=7C2529)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
+[![Latest version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=EE5340&labelColor=7C2529)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
+![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-F5DADF?labelColor=7C2529)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-EE5340?labelColor=7C2529)
 
-Dictation with live provisional text, built on [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) for accented and non-native English, with a second local model that repairs the sentence boundaries behind you. Nothing leaves the machine.
+Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B), which is selected for accuracy on accented and non-native English, and re-punctuates the settled sentences with a second local model. All inference runs on the local machine.
 
 ## Setup
 
