@@ -1,7 +1,8 @@
 # speech-to-text-cli
 🦀 Local real-time speech-to-text for Apple Silicon
 
-![Static Badge](https://img.shields.io/badge/project_status-mvp-lightgrey?style=flat&label=project%20status)
+[![Release](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
+[![Version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=rgb(240,239,235))](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
 ![Static Badge](https://img.shields.io/badge/platform-Apple%20Silicon-rgb(240,239,235))
 ![GitHub License](https://img.shields.io/badge/license-Apache%202.0-rgb(240,239,235))
 
