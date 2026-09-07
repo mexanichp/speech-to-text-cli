@@ -4,7 +4,7 @@
 [![CI/CD status](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
 [![Latest version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=5C97CB)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
 ![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-D29380)
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-646049)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-884332)
 
 Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit), which is selected for accuracy on accented and non-native English, and re-punctuates the settled sentences with [Qwen3-4B](https://huggingface.co/mlx-community/Qwen3-4B-4bit). All inference runs on the local machine.
 
@@ -62,7 +62,7 @@ The transcript prints to stdout as prose when you exit, and it autosaves to `~/.
 | `Luna, copy` | Runs the cleanup pass to the end, and then puts the transcript on the clipboard as prose |
 | `Luna, undo` | Puts back what the last delete, discard, or clear took |
 
-The comma is optional, and `Luna deletes` is the same command. Don't put anything between the name and the verb. To rename the assistant, use `--assistant`.
+A command is the assistant's name followed immediately by the verb, with an optional comma and an optional third-person `-s`. To change the name, use `--assistant`.
 
 ## Options
 
