@@ -1,10 +1,10 @@
 # speech-to-text-cli
 🦀 Local real-time speech-to-text for Apple Silicon
 
-[![Release](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
-[![Version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=F0EEE9)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
-![Static Badge](https://img.shields.io/badge/platform-Apple%20Silicon-F0EEE9)
-![GitHub License](https://img.shields.io/badge/license-Apache%202.0-F0EEE9)
+[![CI/CD status](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd&labelColor=F0EEE9)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
+[![Latest version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=133955&labelColor=F0EEE9)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
+![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-D29380?labelColor=F0EEE9)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-646049?labelColor=F0EEE9)
 
 Dictation with live provisional text, built on [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) for accented and non-native English, with a second local model that repairs the sentence boundaries behind you. Nothing leaves the machine.
 
@@ -14,25 +14,25 @@ Dictation with live provisional text, built on [Qwen3-ASR-1.7B](https://huggingf
 brew install mexanichp/tap/speech-to-text-cli
 ```
 
-Or build it: Apple Silicon, Rust, and [uv](https://github.com/astral-sh/uv).
+To build it yourself on Apple Silicon, install [Rust](https://rustup.rs) and [uv](https://github.com/astral-sh/uv), and then run the following command:
 
 ```sh
 cargo build --release
 ```
 
-First run builds the Python environment in `~/.cache/speech-to-text-cli` and downloads two models, ~1.8 GB and ~2.3 GB.
+The first run creates the Python environment in `~/.cache/speech-to-text-cli` and downloads two models of about 1.8 GB and 2.3 GB.
 
 ## Usage
 
 ```sh
-# microphone
+# Transcribe from the microphone.
 ./target/release/speech-to-text-cli --language en
 
-# 16 kHz mono WAV
+# Transcribe a 16 kHz mono WAV file.
 ./target/release/speech-to-text-cli --simulate audio.wav
 ```
 
-The transcript prints to stdout as prose on exit and autosaves to `~/.local/state/speech-to-text-cli/`.
+The transcript prints to stdout as prose when you exit, and it autosaves to `~/.local/state/speech-to-text-cli/` while you talk.
 
 ```
   Text with no mark has been read back in context and is finished.
@@ -43,52 +43,52 @@ The transcript prints to stdout as prose on exit and autosaves to `~/.local/stat
   listening · 3 sentences · Luna: delete discard keep undo clear copy
 ```
 
-| how it looks | what it means |
+| How it looks | What it means |
 |---|---|
-| dim, `│` | being decoded; the recogniser may still change these words |
-| plain, `·` | transcribed; the cleanup pass may still re-punctuate or re-join it |
-| plain, no mark | finished; only you move it now |
+| Dim, `│` | The recognizer is decoding it and can still change the words |
+| Plain, `·` | The recognizer is finished, and the cleanup pass can still re-punctuate or re-join it |
+| Plain, no mark | The text is finished, and only you move it now |
 
 ## Commands
 
-| spoken | effect |
+| Command | Effect |
 |---|---|
-| `Luna, delete` | drop the last sentence in the transcript |
-| `Luna, discard` | drop the last sentence you just said |
-| `Luna, keep` | file it now instead of waiting out the settle |
-| `Luna, clear` | throw away the whole transcript |
-| `Luna, copy` | run the cleanup pass to the end, then put the transcript on the clipboard as prose |
-| `Luna, undo` | put back what the last delete, discard or clear took |
+| `Luna, delete` | Drops the last sentence in the transcript |
+| `Luna, discard` | Drops the last sentence you said |
+| `Luna, keep` | Files the text now instead of waiting out the settle |
+| `Luna, clear` | Throws away the whole transcript |
+| `Luna, copy` | Runs the cleanup pass to the end, and then puts the transcript on the clipboard as prose |
+| `Luna, undo` | Puts back what the last delete, discard, or clear took |
 
-The comma is optional. `Luna deletes` is the same command. Nothing may come between the name and the verb. Rename with `--assistant`.
+The comma is optional, and `Luna deletes` is the same command. Don't put anything between the name and the verb. To rename the assistant, use `--assistant`.
 
 ## Options
 
-| flag | default | effect |
+| Flag | Default | Effect |
 |---|---|---|
-| `--assistant` | `Luna` | name that prefixes a spoken command |
-| `--language` | auto | force a language, e.g. `en` |
-| `--device` | system | input device name substring |
-| `--simulate` | | replay a 16 kHz mono WAV instead of the microphone |
-| `--agreement` | `3` | hypotheses that must agree before text settles |
-| `--interval-ms` | `400` | shortest gap between re-runs |
-| `--endpoint-ms` | `600` | silence that ends an utterance |
-| `--open-ms` | `150` | how long a sound must last to count as speech |
-| `--continue-ms` | `15000` | shortest silence before text settles |
-| `--continue-max-ms` | `30000` | ceiling on settle adaptation |
-| `--trim-after-s` | `12` | audio buffer length to hold to; this sets latency |
-| `--rms-floor` | `-40` | silence floor in dBFS |
-| `--persist` | off | keep the session file on exit |
-| `--resume [PATH]` | off | continue a previous session |
-| `--quiet` | off | suppress the settling-behind notice |
-| `--model` | `Qwen3-ASR-1.7B-8bit` | any MLX Qwen3-ASR repository |
-| `--cleanup-model` | `Qwen3-4B-4bit` | text model that repairs sentence boundaries |
-| `--no-cleanup` | off | leave the transcript exactly as recognised |
+| `--assistant` | `Luna` | Sets the name that prefixes a spoken command |
+| `--language` | Auto | Forces a language, for example `en` |
+| `--device` | System | Selects the input device whose name contains this substring |
+| `--simulate` | | Replays a 16 kHz mono WAV file instead of the microphone |
+| `--agreement` | `3` | Sets how many hypotheses must agree before text settles |
+| `--interval-ms` | `400` | Sets the shortest gap between re-runs |
+| `--endpoint-ms` | `600` | Sets the silence that ends an utterance |
+| `--open-ms` | `150` | Sets how long a sound must last to count as speech |
+| `--continue-ms` | `15000` | Sets the shortest silence before text settles |
+| `--continue-max-ms` | `30000` | Sets the ceiling on settle adaptation |
+| `--trim-after-s` | `12` | Sets the audio buffer length to hold to, which sets the latency |
+| `--rms-floor` | `-40` | Sets the silence floor in dBFS |
+| `--persist` | Off | Keeps the session file when you exit |
+| `--resume [PATH]` | Off | Continues a previous session |
+| `--quiet` | Off | Suppresses the settling-behind notice |
+| `--model` | `Qwen3-ASR-1.7B-8bit` | Selects any MLX Qwen3-ASR repository |
+| `--cleanup-model` | `Qwen3-4B-4bit` | Selects the text model that repairs sentence boundaries |
+| `--no-cleanup` | Off | Leaves the transcript exactly as recognized |
 
-| variable | effect |
+| Variable | Effect |
 |---|---|
-| `STT_TRACE=<file>` | log every sentence filed, every buffer trim and every cleanup pass |
-| `STT_PYTHON=<path>` | interpreter for the sidecars, instead of the managed one |
+| `STT_TRACE=FILE` | Logs every filed sentence, every buffer trim, and every cleanup pass to FILE |
+| `STT_PYTHON=PATH` | Runs the sidecars on the interpreter at PATH instead of the managed one |
 
 ## Decision record
 
