@@ -6,6 +6,7 @@
 ![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-9c4b34)
 
 Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit), for accuracy on accented and non-native English, and polishes with [Qwen3-4B](https://huggingface.co/mlx-community/Qwen3-4B-4bit). Local native MLX support for Apple silicon with spoken commands.
+
 ## Setup
 
 Install from current repo tap:
@@ -33,10 +34,10 @@ speech-to-text-cli --language en
 speech-to-text-cli --simulate audio.wav
 ```
 
-Recordings persist in `~/.local/state/speech-to-text-cli/`.
+The session file is in `~/.local/state/speech-to-text-cli/`, and a clean exit deletes it unless `--persist`.
 
 ## Commands
-Assuming the assistant parameter was not overriden:
+Assuming the assistant parameter was not overridden:
 
 | Command | Effect |
 |---|---|
