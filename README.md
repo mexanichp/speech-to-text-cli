@@ -3,55 +3,40 @@
 
 [![CI/CD status](https://img.shields.io/github/actions/workflow/status/mexanichp/speech-to-text-cli/release.yml?style=flat&label=ci%2Fcd)](https://github.com/mexanichp/speech-to-text-cli/actions/workflows/release.yml)
 [![Latest version](https://img.shields.io/github/v/release/mexanichp/speech-to-text-cli?style=flat&label=version&color=5C97CB)](https://github.com/mexanichp/speech-to-text-cli/releases/latest)
-![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-D29380)
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-884332)
+![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-9c4b34)
 
-Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit), which is selected for accuracy on accented and non-native English, and re-punctuates the settled sentences with [Qwen3-4B](https://huggingface.co/mlx-community/Qwen3-4B-4bit). All inference runs on the local machine.
-
+Transcribes speech in real time with [Qwen3-ASR-1.7B](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-8bit), for accuracy on accented and non-native English, and polishes with [Qwen3-4B](https://huggingface.co/mlx-community/Qwen3-4B-4bit). Local native MLX support for Apple silicon with spoken commands.
 ## Setup
 
-The formula is in a personal tap, [mexanichp/homebrew-tap](https://github.com/mexanichp/homebrew-tap). It installs the release tarball this repository builds, and it pulls in `uv`.
+Install from current repo tap:
 
 ```sh
 brew install mexanichp/tap/speech-to-text-cli
 ```
 
-To build it yourself on Apple Silicon, install [Rust](https://rustup.rs) and [uv](https://github.com/astral-sh/uv), and then run the following command:
+Build the repo:
 
 ```sh
 cargo build --release
 ```
-
-The first run creates the Python environment in `~/.cache/speech-to-text-cli` and downloads two models of about 1.8 GB and 2.3 GB.
+> Dependencies:
+> - [Rust](https://rustup.rs)
+> - [uv](https://github.com/astral-sh/uv)
 
 ## Usage
 
 ```sh
 # Transcribe from the microphone.
-./target/release/speech-to-text-cli --language en
+speech-to-text-cli --language en
 
 # Transcribe a 16 kHz mono WAV file.
-./target/release/speech-to-text-cli --simulate audio.wav
+speech-to-text-cli --simulate audio.wav
 ```
 
-The transcript prints to stdout as prose when you exit, and it autosaves to `~/.local/state/speech-to-text-cli/` while you talk.
-
-```
-  Text with no mark has been read back in context and is finished.
-· This sentence is transcribed, and the cleanup pass has not reached it.
-│ This is the sentence you are saying right now,
-│ and this part is still being decoded
-
-  listening · 3 sentences · Luna: delete discard keep undo clear copy
-```
-
-| How it looks | What it means |
-|---|---|
-| Dim, `│` | The recognizer is decoding it and can still change the words |
-| Plain, `·` | The recognizer is finished, and the cleanup pass can still re-punctuate or re-join it |
-| Plain, no mark | The text is finished, and only you move it now |
+Recordings persist in `~/.local/state/speech-to-text-cli/`.
 
 ## Commands
+Assuming the assistant parameter was not overriden:
 
 | Command | Effect |
 |---|---|
@@ -62,7 +47,7 @@ The transcript prints to stdout as prose when you exit, and it autosaves to `~/.
 | `Luna, copy` | Runs the cleanup pass to the end, and then puts the transcript on the clipboard as prose |
 | `Luna, undo` | Puts back what the last delete, discard, or clear took |
 
-A command is the assistant's name followed immediately by the verb, with an optional comma and an optional third-person `-s`. To change the name, use `--assistant`.
+To change the name, use `--assistant`.
 
 ## Options
 
