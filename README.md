@@ -34,7 +34,7 @@ speech-to-text-cli --language en
 speech-to-text-cli --simulate audio.wav
 ```
 
-The session file is in `~/.local/state/speech-to-text-cli/`, and a clean exit deletes it unless `--persist`.
+The session file lives temporarily in `~/.local/state/speech-to-text-cli/`, and `--persist` keeps it after the session ends.
 
 ## Commands
 Assuming the assistant parameter was not overridden:
