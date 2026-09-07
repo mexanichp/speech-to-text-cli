@@ -14,7 +14,7 @@ Install from current repo tap:
 brew install mexanichp/tap/speech-to-text-cli
 ```
 
-Build the repo:
+Alternatively, build the repo:
 
 ```sh
 cargo build --release
