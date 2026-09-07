@@ -47,7 +47,7 @@ Assuming the assistant parameter was not overriden:
 | `Luna, copy` | Runs the cleanup pass to the end, and then puts the transcript on the clipboard as prose |
 | `Luna, undo` | Puts back what the last delete, discard, or clear took |
 
-To change the name, use `--assistant`.
+To change the assistant's name, see options below.
 
 ## Options
 
